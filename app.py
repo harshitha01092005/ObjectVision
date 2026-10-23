@@ -831,6 +831,8 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 self.visual_memory,
                 frame_fresh=True,
                 camera_connected=True,
+                image_width=image.shape[1],
+                image_height=image.shape[0],
             )
 
             frame_age_seconds = max(0.0, now - frame_received_at)

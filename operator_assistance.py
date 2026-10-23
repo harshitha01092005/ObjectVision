@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,6 +51,17 @@ def _region_label(box: tuple[float, float, float, float], width: float, height: 
     return "lower-right"
 
 
+def _confidence_value(detection: Any) -> float | None:
+    value = getattr(detection, "confidence", 0.0)
+    if isinstance(value, (str, bytes, bytearray)):
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return confidence if math.isfinite(confidence) else None
+
+
 def generate_operator_assistance(
     detections: list[Any],
     image_quality: Any | None = None,
@@ -59,6 +71,8 @@ def generate_operator_assistance(
     frame_fresh: bool = True,
     camera_connected: bool = True,
     config: OperatorAssistanceConfig | None = None,
+    image_width: float | None = None,
+    image_height: float | None = None,
 ) -> OperatorAssistanceResult:
     cfg = config or OperatorAssistanceConfig()
     warnings: list[str] = []
@@ -86,8 +100,35 @@ def generate_operator_assistance(
     elif motion is not None and getattr(motion, "status", "UNKNOWN") == "UNKNOWN":
         warnings.append("Camera-motion estimation is unavailable.")
 
+    width = 0.0
+    height = 0.0
+    dimensions_valid = False
+    if (
+        image_width is not None
+        and image_height is not None
+        and not isinstance(image_width, bool)
+        and not isinstance(image_height, bool)
+    ):
+        try:
+            width = float(image_width)
+            height = float(image_height)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            dimensions_valid = (
+                math.isfinite(width)
+                and math.isfinite(height)
+                and width >= 1
+                and height >= 1
+            )
+
     if detections:
-        low_confidence = [d for d in detections if getattr(d, "confidence", 0.0) < cfg.confidence_threshold]
+        low_confidence = [
+            detection
+            for detection in detections
+            if (confidence := _confidence_value(detection)) is not None
+            and confidence < cfg.confidence_threshold
+        ]
         if low_confidence:
             warnings.append("Detection confidence is low; inspect this observation carefully.")
 
@@ -100,19 +141,30 @@ def generate_operator_assistance(
         if active_tracks and any(len(track.confidence_history) >= 3 for track in active_tracks):
             suggestions.append("The same object has been observed consistently across multiple frames.")
 
-    if detections:
+    if detections and dimensions_valid:
         for detection in detections:
-            box = (
-                float(getattr(detection, "x1", 0.0)),
-                float(getattr(detection, "y1", 0.0)),
-                float(getattr(detection, "x2", 0.0)),
-                float(getattr(detection, "y2", 0.0)),
-            )
-            if getattr(detection, "confidence", 0.0) >= cfg.confidence_threshold:
-                region = _region_label(box, 1.0, 1.0)
-                if region in {"upper-left", "upper-center", "upper-right", "lower-left", "lower-center", "lower-right"}:
-                    suggestions.append(f"A small object has been detected in the {region} image region.")
-                    break
+            confidence = _confidence_value(detection)
+            if confidence is None or confidence < cfg.confidence_threshold:
+                continue
+            try:
+                box = (
+                    float(getattr(detection, "x1", 0.0)),
+                    float(getattr(detection, "y1", 0.0)),
+                    float(getattr(detection, "x2", 0.0)),
+                    float(getattr(detection, "y2", 0.0)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                not all(math.isfinite(value) for value in box)
+                or box[2] <= box[0]
+                or box[3] <= box[1]
+            ):
+                continue
+            region = _region_label(box, width, height)
+            if region in {"upper-left", "upper-center", "upper-right", "center", "lower-left", "lower-center", "lower-right"}:
+                suggestions.append(f"A small object has been detected in the {region} image region.")
+                break
 
     if not warnings and not suggestions:
         suggestions.append("The observation appears stable and the object should be reviewed in context.")
@@ -134,6 +186,8 @@ def build_operator_assistance(
     frame_fresh: bool = True,
     camera_connected: bool = True,
     config: OperatorAssistanceConfig | None = None,
+    image_width: float | None = None,
+    image_height: float | None = None,
 ) -> OperatorAssistanceResult:
     return generate_operator_assistance(
         detections,
@@ -143,4 +197,6 @@ def build_operator_assistance(
         frame_fresh=frame_fresh,
         camera_connected=camera_connected,
         config=config,
+        image_width=image_width,
+        image_height=image_height,
     )

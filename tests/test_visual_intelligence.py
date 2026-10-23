@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import cv2
@@ -20,6 +21,152 @@ class FakeDetection:
 
 
 class VisualIntelligenceTests(unittest.TestCase):
+    @staticmethod
+    def location_suggestion(box, *, confidence=0.9, **dimensions):
+        result = generate_operator_assistance(
+            [FakeDetection("person", confidence, *box)],
+            camera_connected=False,
+            **dimensions,
+        )
+        return next(
+            (
+                suggestion
+                for suggestion in result.suggestions
+                if suggestion.startswith(
+                    "A small object has been detected in the "
+                )
+            ),
+            None,
+        )
+
+    def test_operator_assistance_classifies_pixel_boxes_by_region(self):
+        cases = (
+            ((10, 10, 40, 40), "upper-left"),
+            ((130, 10, 170, 40), "upper-center"),
+            ((260, 10, 290, 40), "upper-right"),
+        )
+        for box, region in cases:
+            with self.subTest(region=region):
+                self.assertEqual(
+                    self.location_suggestion(
+                        box, image_width=300, image_height=300
+                    ),
+                    f"A small object has been detected in the {region} image region.",
+                )
+
+    def test_operator_assistance_classifies_boxes_at_horizontal_boundaries(self):
+        cases = (
+            ((95.5, 10, 101.5, 20), "upper-left"),
+            ((96, 10, 102, 20), "upper-center"),
+            ((194.5, 10, 200.5, 20), "upper-center"),
+            ((195, 10, 201, 20), "upper-right"),
+        )
+        for box, region in cases:
+            with self.subTest(box=box):
+                self.assertEqual(
+                    self.location_suggestion(
+                        box, image_width=300, image_height=300
+                    ),
+                    f"A small object has been detected in the {region} image region.",
+                )
+
+    def test_operator_assistance_classifies_boxes_at_vertical_boundaries(self):
+        cases = (
+            ((130, 95.5, 170, 101.5), "upper-center"),
+            ((130, 96, 170, 102), "center"),
+            ((130, 194.5, 170, 200.5), "center"),
+            ((130, 195, 170, 201), "lower-center"),
+        )
+        for box, region in cases:
+            with self.subTest(box=box):
+                self.assertEqual(
+                    self.location_suggestion(
+                        box, image_width=300, image_height=300
+                    ),
+                    f"A small object has been detected in the {region} image region.",
+                )
+
+    def test_operator_assistance_skips_invalid_boxes_but_keeps_other_assistance(self):
+        location_suggestions = {
+            f"A small object has been detected in the {region} image region."
+            for region in (
+                "upper-left",
+                "upper-center",
+                "upper-right",
+                "lower-left",
+                "lower-center",
+                "lower-right",
+            )
+        }
+        invalid_boxes = (
+            (None, 10, 30, 40),
+            ("not-a-coordinate", 10, 30, 40),
+            (math.nan, 10, 30, 40),
+            (20, 10, 20, 40),
+        )
+        for box in invalid_boxes:
+            with self.subTest(box=box):
+                result = generate_operator_assistance(
+                    [FakeDetection("person", 0.9, *box)],
+                    camera_connected=False,
+                    image_width=300,
+                    image_height=300,
+                )
+                self.assertTrue(
+                    location_suggestions.isdisjoint(result.suggestions)
+                )
+                self.assertIn(
+                    "Camera connection is unavailable.",
+                    result.warnings,
+                )
+
+        result = generate_operator_assistance(
+            [
+                FakeDetection("person", 0.9, None, 10, 30, 40),
+                FakeDetection("person", 0.9, 10, 10, 40, 40),
+            ],
+            camera_connected=False,
+            image_width=300,
+            image_height=300,
+        )
+        self.assertIn(
+            "A small object has been detected in the upper-left image region.",
+            result.suggestions,
+        )
+        self.assertIn("Camera connection is unavailable.", result.warnings)
+
+    def test_operator_assistance_handles_malformed_confidence_values(self):
+        for confidence in (None, "0.9", "not-a-confidence", math.nan, math.inf):
+            with self.subTest(confidence=confidence):
+                result = generate_operator_assistance(
+                    [FakeDetection("person", confidence, 10, 10, 40, 40)],
+                    camera_connected=False,
+                    image_width=300,
+                    image_height=300,
+                )
+                self.assertNotIn(
+                    "A small object has been detected in the upper-left image region.",
+                    result.suggestions,
+                )
+                self.assertIn(
+                    "Camera connection is unavailable.",
+                    result.warnings,
+                )
+
+    def test_operator_assistance_suppresses_location_without_valid_dimensions(self):
+        box = (10, 10, 40, 40)
+        invalid_dimensions = (
+            {},
+            {"image_width": 0, "image_height": 300},
+            {"image_width": math.nan, "image_height": 300},
+            {"image_width": "not-a-dimension", "image_height": 300},
+        )
+        for dimensions in invalid_dimensions:
+            with self.subTest(dimensions=dimensions):
+                self.assertIsNone(
+                    self.location_suggestion(box, **dimensions)
+                )
+
     def test_image_quality_detects_clear_and_blurred_frames(self):
         clear = np.full((256, 256, 3), 180, dtype=np.uint8)
         clear[40:120, 40:120] = 220

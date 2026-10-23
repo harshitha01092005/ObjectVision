@@ -101,6 +101,16 @@ class NavigationEngineTests(unittest.TestCase):
         self.assertTrue(result.regions["LEFT"].objects)
         self.assertTrue(result.regions["CENTER"].objects)
 
+    def test_partially_out_of_frame_detection_is_clipped_to_left_region(self) -> None:
+        result = self.evaluate([self.box("person", 0.9, -10, 100, 30, 130)])
+
+        self.assertEqual(len(result.detections), 1)
+        self.assertEqual(result.detections[0].box, (0, 100, 30, 130))
+        self.assertEqual(result.detections[0].regions, ("LEFT",))
+        self.assertEqual(result.regions["LEFT"].objects, ("person",))
+        self.assertFalse(result.regions["CENTER"].objects)
+        self.assertFalse(result.regions["RIGHT"].objects)
+
     def test_missing_or_stale_frames_are_uncertain(self) -> None:
         missing = self.engine.evaluate([], None, None, None, now=self.now)
         stale = self.evaluate([], frame_time=self.now - 10)

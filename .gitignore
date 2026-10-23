@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.streamlit/
+certs/
+
+.stream_state/
+*.py[cod]
+*.pt
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+.DS_Store

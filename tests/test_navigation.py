@@ -64,6 +64,39 @@ class NavigationEngineTests(unittest.TestCase):
         self.assertEqual(self.evaluate(detections).recommendation, UNCERTAIN)
         self.assertEqual(self.evaluate(detections).recommendation, GO_RIGHT)
 
+    def test_stale_frame_resets_confirmed_left_direction(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+        stale = self.evaluate([], frame_time=self.now - 10)
+        self.assertEqual(stale.recommendation, UNCERTAIN)
+        self.assertFalse(stale.frame_fresh)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+    def test_low_confidence_frame_resets_confirmed_left_direction(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+        insufficient = self.evaluate(
+            [self.box("person", 0.2, 110, 30, 190, 150)]
+        )
+        self.assertEqual(insufficient.recommendation, UNCERTAIN)
+        self.assertTrue(insufficient.frame_fresh)
+        self.assertFalse(insufficient.valid_evidence)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
     def test_both_sides_obstructed_suggests_stop(self) -> None:
         result = self.evaluate(
             [

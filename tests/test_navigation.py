@@ -111,6 +111,32 @@ class NavigationEngineTests(unittest.TestCase):
         self.assertFalse(result.regions["CENTER"].objects)
         self.assertFalse(result.regions["RIGHT"].objects)
 
+    def test_partially_out_of_frame_detections_are_clipped_at_other_edges(self) -> None:
+        cases = (
+            ((120, -10, 150, 30), (120, 0, 150, 30), ("CENTER",)),
+            ((280, 100, 310, 130), (280, 100, 300, 130), ("RIGHT",)),
+            ((120, 280, 150, 310), (120, 280, 150, 300), ("CENTER",)),
+        )
+        for box, clipped_box, regions in cases:
+            with self.subTest(box=box):
+                result = self.evaluate([self.box("person", 0.9, *box)])
+
+                self.assertEqual(len(result.detections), 1)
+                self.assertEqual(result.detections[0].box, clipped_box)
+                self.assertEqual(result.detections[0].regions, regions)
+                for region in ("LEFT", "CENTER", "RIGHT"):
+                    expected_objects = ("person",) if region in regions else ()
+                    self.assertEqual(
+                        result.regions[region].objects, expected_objects
+                    )
+
+    def test_detection_entirely_outside_frame_is_rejected(self) -> None:
+        result = self.evaluate([self.box("person", 0.9, -30, 100, -1, 130)])
+
+        self.assertEqual(result.detections, ())
+        self.assertEqual(result.recommendation, UNCERTAIN)
+        self.assertFalse(result.valid_evidence)
+
     def test_missing_or_stale_frames_are_uncertain(self) -> None:
         missing = self.engine.evaluate([], None, None, None, now=self.now)
         stale = self.evaluate([], frame_time=self.now - 10)

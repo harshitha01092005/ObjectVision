@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -7,7 +8,7 @@ import numpy as np
 from image_quality import analyze_image_quality
 from motion_analysis import estimate_camera_motion
 from operator_assistance import generate_operator_assistance
-from visual_memory import VisualMemory
+from visual_memory import VisualMemory, VisualMemoryConfig
 
 
 class FakeDetection:
@@ -212,6 +213,88 @@ class VisualIntelligenceTests(unittest.TestCase):
             memory.update([], timestamp=float(idx + 1))
         memory.update([FakeDetection("person", 0.9, 11, 21, 81, 121)], timestamp=10.0)
         self.assertTrue(any(event["event"] == "object reacquired" for event in memory.events))
+
+    def test_visual_memory_bounds_all_track_histories(self):
+        memory = VisualMemory(VisualMemoryConfig(max_history=2))
+        for index in range(4):
+            memory.update(
+                [
+                    FakeDetection(
+                        "person",
+                        0.5 + index * 0.1,
+                        10 + index,
+                        20,
+                        80 + index,
+                        120,
+                    )
+                ],
+                timestamp=float(index),
+                image_quality=SimpleNamespace(status=f"quality-{index}"),
+                motion=SimpleNamespace(status=f"motion-{index}"),
+            )
+
+        track = memory.tracks[1]
+        self.assertEqual(len(track.box_history), 2)
+        self.assertEqual(len(track.confidence_history), 2)
+        self.assertEqual(len(track.quality_history), 2)
+        self.assertEqual(len(track.motion_history), 2)
+        self.assertEqual(track.quality_history, ["quality-2", "quality-3"])
+        self.assertEqual(track.motion_history, ["motion-2", "motion-3"])
+
+    def test_visual_memory_evicts_lost_then_temporarily_missing_tracks(self):
+        memory = VisualMemory(VisualMemoryConfig(max_tracks=3))
+        memory.update(
+            [
+                FakeDetection("person", 0.9, 0, 0, 20, 20),
+                FakeDetection("car", 0.9, 30, 0, 50, 20),
+                FakeDetection("dog", 0.9, 60, 0, 80, 20),
+            ],
+            timestamp=1.0,
+        )
+        memory.tracks[1].status = "LOST"
+        memory.tracks[1].last_seen = 1.0
+        memory.tracks[2].status = "TEMPORARILY MISSING"
+        memory.tracks[2].last_seen = 2.0
+
+        memory.update(
+            [FakeDetection("dog", 0.9, 60, 0, 80, 20), FakeDetection("cat", 0.9, 90, 0, 110, 20)],
+            timestamp=3.0,
+        )
+        self.assertEqual(set(memory.tracks), {2, 3, 4})
+
+        memory.update(
+            [FakeDetection("dog", 0.9, 60, 0, 80, 20), FakeDetection("cat", 0.9, 90, 0, 110, 20), FakeDetection("bird", 0.9, 120, 0, 140, 20)],
+            timestamp=4.0,
+        )
+        self.assertEqual(set(memory.tracks), {3, 4, 5})
+
+    def test_visual_memory_evicts_oldest_track_when_all_tracks_are_active(self):
+        memory = VisualMemory(
+            VisualMemoryConfig(max_tracks=2, temp_missing_limit=10)
+        )
+        memory.update([FakeDetection("person", 0.9, 0, 0, 20, 20)], timestamp=1.0)
+        memory.update([FakeDetection("car", 0.9, 30, 0, 50, 20)], timestamp=2.0)
+        memory.update([FakeDetection("dog", 0.9, 60, 0, 80, 20)], timestamp=3.0)
+        self.assertTrue(all(track.status == "ACTIVE" for track in memory.tracks.values()))
+
+        memory.update([FakeDetection("bird", 0.9, 90, 0, 110, 20)], timestamp=4.0)
+        self.assertEqual(set(memory.tracks), {3, 4})
+        self.assertTrue(all(track.status == "ACTIVE" for track in memory.tracks.values()))
+
+    def test_visual_memory_bounds_event_history(self):
+        memory = VisualMemory(VisualMemoryConfig(max_events=2))
+
+        for index, label in enumerate(("person", "car", "dog"), start=1):
+            memory.update(
+                [FakeDetection(label, 0.9, index * 30, 0, index * 30 + 20, 20)],
+                timestamp=float(index),
+            )
+
+        self.assertEqual(len(memory.events), 2)
+        self.assertEqual(
+            [event["label"] for event in memory.events],
+            ["car", "dog"],
+        )
 
     def test_operator_assistance_prioritizes_important_warnings(self):
         blurred = np.full((256, 256, 3), 180, dtype=np.uint8)

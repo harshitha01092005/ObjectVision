@@ -62,9 +62,16 @@ class TrackedObject:
 class VisualMemoryConfig:
     max_history: int = 20
     max_events: int = 30
+    max_tracks: int = 128
     temp_missing_limit: int = 3
     lost_after: int = 8
     iou_threshold: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.max_history < 1:
+            raise ValueError("max_history must be positive.")
+        if self.max_tracks < 1:
+            raise ValueError("max_tracks must be positive.")
 
 
 class VisualMemory:
@@ -208,12 +215,30 @@ class VisualMemory:
                 )
 
         for track_id, track in list(self.tracks.items()):
-            if track.status == "LOST":
-                continue
             if len(track.box_history) > self.config.max_history:
                 track.box_history = track.box_history[-self.config.max_history:]
             if len(track.confidence_history) > self.config.max_history:
                 track.confidence_history = track.confidence_history[-self.config.max_history:]
+            if len(track.quality_history) > self.config.max_history:
+                track.quality_history = track.quality_history[-self.config.max_history:]
+            if len(track.motion_history) > self.config.max_history:
+                track.motion_history = track.motion_history[-self.config.max_history:]
+
+        eviction_priority = {
+            "LOST": 0,
+            "TEMPORARILY MISSING": 1,
+            "ACTIVE": 2,
+        }
+        while len(self.tracks) > self.config.max_tracks:
+            track_id = min(
+                self.tracks,
+                key=lambda candidate_id: (
+                    eviction_priority.get(self.tracks[candidate_id].status, 2),
+                    self.tracks[candidate_id].last_seen,
+                    candidate_id,
+                ),
+            )
+            del self.tracks[track_id]
 
         return self.as_dict()
 

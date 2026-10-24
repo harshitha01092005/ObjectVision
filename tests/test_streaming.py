@@ -168,6 +168,19 @@ class StreamPipelineTests(unittest.TestCase):
                 output = processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
         return model, snapshots, output
 
+    def test_navigation_config_loads_missing_track_age(self) -> None:
+        with (
+            patch.object(
+                app,
+                "read_json",
+                return_value={"max_missing_track_age_seconds": 0.8},
+            ),
+            patch.object(app, "read_confidence", return_value=0.35),
+        ):
+            config = app.read_navigation_config()
+
+        self.assertEqual(config.max_missing_track_age_seconds, 0.8)
+
     def test_receiver_runs_model_and_publishes_empty_detection_frame(self) -> None:
         model, snapshots, output = self.run_processor("custom", include_person=False)
 
@@ -202,6 +215,50 @@ class StreamPipelineTests(unittest.TestCase):
         self.assertEqual(len(navigation["detections"]), 1)
         self.assertEqual(navigation["detections"][0]["name"], "person")
         self.assertEqual(navigation["frame_fresh"], True)
+
+    def test_navigation_uses_memory_updated_from_the_evaluated_frame(self) -> None:
+        memory_snapshots: list[dict[str, object]] = []
+        call_order: list[str] = []
+        original_memory_update = app.VisualMemory.update
+        original_evaluate = app.NavigationEngine.evaluate
+
+        def update_memory(memory, detections, **kwargs):
+            snapshot = original_memory_update(memory, detections, **kwargs)
+            memory_snapshots.append(snapshot)
+            call_order.append("memory")
+            return snapshot
+
+        def evaluate_navigation(engine, *args, **kwargs):
+            call_order.append("navigation")
+            self.assertTrue(memory_snapshots)
+            self.assertEqual(
+                kwargs["visual_memory_tracks"],
+                memory_snapshots[-1]["tracks"],
+            )
+            self.assertEqual(
+                memory_snapshots[-1]["tracks"][0]["last_seen"],
+                args[3],
+            )
+            return original_evaluate(engine, *args, **kwargs)
+
+        with (
+            patch.object(app.VisualMemory, "update", new=update_memory),
+            patch.object(
+                app.NavigationEngine,
+                "evaluate",
+                new=evaluate_navigation,
+            ),
+        ):
+            _, snapshots, _ = self.run_processor(
+                "navigation",
+                include_person=True,
+            )
+        self.assertLess(call_order.index("memory"), call_order.index("navigation"))
+        self.assertEqual(len(snapshots[0][0]["visual_memory"]["tracks"]), 1)
+        self.assertEqual(
+            snapshots[0][0]["visual_memory"]["tracks"][0]["status"],
+            "ACTIVE",
+        )
 
     def test_raw_confidence_threshold_filters_custom_and_coco_results(self) -> None:
         for mode in ("custom", "coco"):

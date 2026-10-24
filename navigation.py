@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 from typing import Iterable
 
 
@@ -59,6 +60,7 @@ class NavigationConfig:
     blocked_region_score: float = 0.65
     side_clearance_margin: float = 0.25
     max_frame_age_seconds: float = 2.5
+    max_missing_track_age_seconds: float = 1.5
     relevant_classes: frozenset[str] = RELEVANT_CLASSES
 
     def __post_init__(self) -> None:
@@ -91,6 +93,8 @@ class NavigationConfig:
             or self.side_clearance_margin < 0
             or not math.isfinite(self.max_frame_age_seconds)
             or self.max_frame_age_seconds <= 0
+            or not math.isfinite(self.max_missing_track_age_seconds)
+            or self.max_missing_track_age_seconds <= 0
         ):
             raise ValueError("Navigation score and frame-age thresholds must be non-negative and finite.")
         if not all(isinstance(name, str) for name in self.relevant_classes):
@@ -169,6 +173,7 @@ class NavigationEngine:
         frame_timestamp: float | None,
         *,
         now: float | None = None,
+        visual_memory_tracks: Iterable[Mapping[str, object]] | None = None,
     ) -> NavigationResult:
         current_time = time.time() if now is None else now
         frame_age = (
@@ -318,6 +323,27 @@ class NavigationEngine:
             low_confidence_count,
             frame_age,
         )
+        if (
+            result.recommendation in {GO_LEFT, GO_RIGHT}
+            and self._has_recent_missing_track(
+                visual_memory_tracks,
+                "LEFT" if result.recommendation == GO_LEFT else "RIGHT",
+                frame_width,
+                frame_height,
+                current_time,
+            )
+        ):
+            result = replace(
+                result,
+                recommendation=UNCERTAIN,
+                explanation=(
+                    "A recently missing relevant object was last seen in the "
+                    f"{'left' if result.recommendation == GO_LEFT else 'right'} region."
+                ),
+            )
+            self._pending_direction = None
+            self._pending_direction_frames = 0
+            self._confirmed_direction = None
         return result
 
     def _decide(
@@ -421,6 +447,82 @@ class NavigationEngine:
         if previous[3] <= 0:
             return None
         return area_fraction / previous[3]
+
+    def _has_recent_missing_track(
+        self,
+        tracks: Iterable[Mapping[str, object]] | None,
+        region: str,
+        frame_width: int,
+        frame_height: int,
+        current_time: float,
+    ) -> bool:
+        if tracks is None:
+            return False
+
+        region_index = REGIONS.index(region)
+        region_left = region_index * frame_width / 3
+        region_right = (region_index + 1) * frame_width / 3
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                continue
+            if track.get("status") != "TEMPORARILY MISSING":
+                continue
+            label = track.get("label")
+            if not isinstance(label, str) or label not in self.config.relevant_classes:
+                continue
+
+            last_seen = track.get("last_seen")
+            if (
+                not isinstance(last_seen, (int, float))
+                or isinstance(last_seen, bool)
+            ):
+                continue
+            try:
+                last_seen = float(last_seen)
+            except (OverflowError, ValueError):
+                continue
+            if not math.isfinite(last_seen):
+                continue
+            age = current_time - last_seen
+            if not 0 <= age <= self.config.max_missing_track_age_seconds:
+                continue
+
+            box_history = track.get("box_history")
+            if not isinstance(box_history, (list, tuple)) or not box_history:
+                continue
+            box = box_history[-1]
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            if not all(isinstance(value, (int, float)) for value in box):
+                continue
+            if any(isinstance(value, bool) for value in box):
+                continue
+            try:
+                x1, y1, x2, y2 = (float(value) for value in box)
+            except (OverflowError, ValueError):
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (x1, y1, x2, y2)
+            ):
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            clipped_left = max(0.0, x1)
+            clipped_right = min(float(frame_width), x2)
+            clipped_top = max(0.0, y1)
+            clipped_bottom = min(float(frame_height), y2)
+            if (
+                clipped_right <= clipped_left
+                or clipped_bottom <= clipped_top
+            ):
+                continue
+            if min(clipped_right, region_right) > max(
+                clipped_left, region_left
+            ):
+                return True
+        return False
 
     def _proximity(
         self,

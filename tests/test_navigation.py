@@ -8,6 +8,7 @@ from navigation import (
     STOP,
     UNCERTAIN,
     Detection,
+    NavigationConfig,
     NavigationEngine,
 )
 
@@ -17,7 +18,13 @@ class NavigationEngineTests(unittest.TestCase):
         self.engine = NavigationEngine()
         self.now = 100.0
 
-    def evaluate(self, detections: list[Detection], *, frame_time: float | None = None):
+    def evaluate(
+        self,
+        detections: list[Detection],
+        *,
+        frame_time: float | None = None,
+        visual_memory_tracks: list[dict[str, object]] | None = None,
+    ):
         self.now += 0.1
         return self.engine.evaluate(
             detections,
@@ -25,6 +32,7 @@ class NavigationEngineTests(unittest.TestCase):
             300,
             self.now if frame_time is None else frame_time,
             now=self.now,
+            visual_memory_tracks=visual_memory_tracks,
         )
 
     @staticmethod
@@ -37,6 +45,20 @@ class NavigationEngineTests(unittest.TestCase):
         y2: float,
     ) -> Detection:
         return Detection(name, confidence, x1, y1, x2, y2)
+
+    @staticmethod
+    def missing_track(
+        box: tuple[object, ...],
+        *,
+        last_seen: object = 100.0,
+        status: str = "TEMPORARILY MISSING",
+    ) -> dict[str, object]:
+        return {
+            "label": "person",
+            "status": status,
+            "last_seen": last_seen,
+            "box_history": [box],
+        }
 
     def test_no_relevant_obstacles_suggests_cautious_forward_movement(self) -> None:
         result = self.evaluate([])
@@ -55,6 +77,135 @@ class NavigationEngineTests(unittest.TestCase):
         ]
         self.assertEqual(self.evaluate(detections).recommendation, UNCERTAIN)
         self.assertEqual(self.evaluate(detections).recommendation, GO_LEFT)
+
+    def test_recent_missing_left_obstacle_downgrades_confirmed_go_left(self) -> None:
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        tracks = [self.missing_track((10, 30, 70, 120), last_seen=self.now)]
+
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            UNCERTAIN,
+        )
+        result = self.evaluate(detections, visual_memory_tracks=tracks)
+        self.assertEqual(result.recommendation, UNCERTAIN)
+        self.assertIn("recently missing", result.explanation)
+
+    def test_recent_missing_right_obstacle_downgrades_confirmed_go_right(self) -> None:
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 5, 20, 75, 140),
+        ]
+        tracks = [self.missing_track((230, 30, 290, 120), last_seen=self.now)]
+
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            UNCERTAIN,
+        )
+        result = self.evaluate(detections, visual_memory_tracks=tracks)
+        self.assertEqual(result.recommendation, UNCERTAIN)
+        self.assertIn("recently missing", result.explanation)
+
+    def test_missing_obstacle_outside_proposed_region_does_not_downgrade(self) -> None:
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        tracks = [self.missing_track((140, 30, 180, 100), last_seen=self.now)]
+
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            UNCERTAIN,
+        )
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            GO_LEFT,
+        )
+
+    def test_expired_or_lost_memory_tracks_do_not_downgrade_direction(self) -> None:
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        tracks = [
+            self.missing_track((10, 30, 70, 120), last_seen=self.now - 2.0),
+            self.missing_track(
+                (10, 30, 70, 120),
+                last_seen=self.now,
+                status="LOST",
+            ),
+        ]
+
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            UNCERTAIN,
+        )
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            GO_LEFT,
+        )
+
+    def test_maximum_missing_track_age_is_inclusive(self) -> None:
+        engine = NavigationEngine(
+            NavigationConfig(max_missing_track_age_seconds=1.5)
+        )
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        tracks = [self.missing_track((10, 30, 70, 120), last_seen=98.5)]
+        results = [
+            engine.evaluate(
+                detections,
+                300,
+                300,
+                100.0,
+                now=100.0,
+                visual_memory_tracks=tracks,
+            )
+            for _ in range(2)
+        ]
+
+        self.assertEqual(results[0].recommendation, UNCERTAIN)
+        self.assertEqual(results[1].recommendation, UNCERTAIN)
+        self.assertIn("recently missing", results[1].explanation)
+
+    def test_invalid_memory_timestamps_and_boxes_are_ignored(self) -> None:
+        detections = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        tracks = [
+            self.missing_track((10, 30, 70, 120), last_seen=math.nan),
+            self.missing_track(("bad", 30, 70, 120)),
+            self.missing_track((10, 30, 70, 120), last_seen=True),
+            self.missing_track((10, 30, 10, 120)),
+        ]
+
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            UNCERTAIN,
+        )
+        self.assertEqual(
+            self.evaluate(detections, visual_memory_tracks=tracks).recommendation,
+            GO_LEFT,
+        )
+
+    def test_memory_caution_preserves_stop_and_uncertain_results(self) -> None:
+        tracks = [self.missing_track((10, 30, 70, 120), last_seen=self.now)]
+        stop = self.evaluate(
+            [self.box("person", 0.95, 110, 30, 190, 270)],
+            visual_memory_tracks=tracks,
+        )
+        self.assertEqual(stop.recommendation, STOP)
+
+        uncertain = self.evaluate(
+            [self.box("person", 0.2, 110, 30, 190, 150)],
+            visual_memory_tracks=tracks,
+        )
+        self.assertEqual(uncertain.recommendation, UNCERTAIN)
 
     def test_center_blocked_and_right_clear_suggests_right_after_confirmation(self) -> None:
         detections = [

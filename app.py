@@ -200,6 +200,12 @@ def read_navigation_config() -> NavigationConfig:
             state.get("side_clearance_margin", defaults.side_clearance_margin)
         ),
         max_frame_age_seconds=defaults.max_frame_age_seconds,
+        max_missing_track_age_seconds=float(
+            state.get(
+                "max_missing_track_age_seconds",
+                defaults.max_missing_track_age_seconds,
+            )
+        ),
         relevant_classes=frozenset(configured_classes),
     )
 
@@ -766,10 +772,17 @@ class ObjectVideoProcessor(VideoProcessorBase):
             )
             annotated = draw_detection_annotations(image, stabilized_detections)
             detection_count = sum(class_counts.values())
+            memory_snapshot = self.visual_memory.update(
+                detection_inputs,
+                timestamp=frame_received_at,
+                image_quality=quality,
+                motion=motion,
+            )
             navigation_result = None
             if mode in {"coco", "navigation"}:
                 height, width = image.shape[:2]
-                frame_age = max(0.0, time.time() - frame_received_at)
+                navigation_now = time.time()
+                frame_age = max(0.0, navigation_now - frame_received_at)
                 fresh_frame = frame_age <= self.navigation_config.max_frame_age_seconds
                 guidance_input = detection_inputs if fresh_frame else []
                 navigation_result = self.navigation_engine.evaluate(
@@ -777,16 +790,9 @@ class ObjectVideoProcessor(VideoProcessorBase):
                     width,
                     height,
                     frame_received_at if fresh_frame else None,
-                    now=time.time(),
+                    now=navigation_now,
+                    visual_memory_tracks=memory_snapshot.get("tracks", []),
                 )
-                if not fresh_frame:
-                    navigation_result = self.navigation_engine.evaluate(
-                        [],
-                        width,
-                        height,
-                        None,
-                        now=time.time(),
-                    )
                 navigation_result = gate_navigation_evidence(
                     navigation_result,
                     image_quality_status=quality.status,
@@ -818,12 +824,6 @@ class ObjectVideoProcessor(VideoProcessorBase):
             mode_history.append({"time": now, **class_counts})
             del mode_history[:-30]
 
-            memory_snapshot = self.visual_memory.update(
-                detection_inputs,
-                timestamp=frame_received_at,
-                image_quality=quality,
-                motion=motion,
-            )
             assistance = generate_operator_assistance(
                 detection_inputs,
                 quality,
@@ -1444,6 +1444,14 @@ def render_navigation_controls() -> None:
             value=max(config.high_growth_ratio, medium_growth + 0.01),
             step=0.01,
         )
+        max_missing_track_age = st.slider(
+            "Maximum age for missing-obstacle caution (seconds)",
+            min_value=0.1,
+            max_value=5.0,
+            value=config.max_missing_track_age_seconds,
+            step=0.1,
+            help="A recently missing relevant object can make a directional suggestion uncertain for this long after it was last seen.",
+        )
     blocked_score = st.slider(
         "Region obstruction threshold",
         min_value=0.1,
@@ -1472,6 +1480,7 @@ def render_navigation_controls() -> None:
             "high_growth_ratio": high_growth,
             "blocked_region_score": blocked_score,
             "side_clearance_margin": side_margin,
+            "max_missing_track_age_seconds": max_missing_track_age,
         },
     )
 

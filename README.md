@@ -192,6 +192,89 @@ repeatability alone does not mean the system is fast or safe. Use the same
 prerecorded source and matching environment/settings when reproducibility
 against real footage is required; the benchmark does not save input frames.
 
+### Real WebRTC stream telemetry
+
+The `FrameSequence` benchmark above drives `ObjectVideoProcessor.recv()` with
+synthetic or prerecorded frames. It does **not** measure WebRTC transport or a
+phone camera. For a real phone session, use the Android Camera page's bounded
+telemetry controls:
+
+1. Start the laptop server with `bash run_https.sh`; connect the phone and
+   laptop to the same non-isolated Wi-Fi network.
+2. Open the printed HTTPS **Android camera** URL on Android Chrome. Choose one
+   inference mode, keep the phone in a fixed orientation, tap **START**, and
+   wait for model initialization and a steady stream.
+3. Click **Reset telemetry after warm-up** on the Android Camera page. The
+   subsequent callback starts a new monotonic measurement interval.
+4. Keep the same mode/settings and stream active for a fixed duration, then
+   click **Prepare telemetry export**, then **Download current stream
+   telemetry**. Preparation hashes the model weights outside the frame
+   callback and exports a JSON file with counters and bounded timing records;
+   it does not save frames.
+5. Convert and validate the export to a report, choosing a new output filename:
+
+   ```bash
+   .venv/bin/python benchmark_latency.py \
+     --telemetry objectvision-real-stream-telemetry.json \
+     --output real-stream-run-1.json
+   ```
+
+6. Repeat the run with the same laptop, phone/browser, network, mode, confidence,
+   camera orientation/resolution, model weights, and test duration. Convert the
+   next export to a different report path. Compare only compatible reports:
+
+   ```bash
+   .venv/bin/python benchmark_latency.py \
+     --compare real-stream-run-1.json real-stream-run-2.json \
+     --output real-stream-repeatability.json
+   ```
+
+The telemetry includes counts for callbacks, valid decoded frames, legacy
+`frames_received` and `frames_skipped`, inference throttling, retry suppression,
+processing failures, successful processing, and completed/failed snapshot
+publication. Processing failures count accepted-frame exceptions before a
+successful snapshot publication; the two rate counters distinguish attempts
+from completed snapshot results. Receive and successful-processing rates
+include their event counts and a monotonic elapsed-time denominator.
+`frames_skipped` retains its
+existing meaning: invalid/empty frames only; it is not a count of throttled
+frames. Counts cover the whole measurement interval; detailed frame timing
+samples are bounded to the most recent 1,200 successful publications, and
+dashboard samples to the most recent 600 records. The report marks truncation.
+
+`callback_to_snapshot_publication_ms` is measured on the laptop from entry to
+the WebRTC `recv()` callback through successful atomic snapshot replacement.
+`snapshot_publication_ms` includes JPEG encoding and the atomic file replace;
+neither is included in the established `frame_processing_latency_ms`.
+`inference_latency_ms`, `navigation_evaluation_latency_ms`, and
+`frame_processing_latency_ms` retain their existing boundaries. The rate
+denominator begins at the first callback after telemetry reset and ends when
+the telemetry is exported. Early exits and failures do not create successful
+frame timing samples; their event counts are exported separately.
+
+`dashboard_snapshot_read_ms` measures the laptop's file read and metadata
+parsing. `dashboard_render_call_ms` measures the Python-side Streamlit view
+function call. Both are server-side measurements; render-call timing does not
+measure browser paint or when pixels become visible to a person. The phone
+browser and camera do not currently provide a correlated capture timestamp,
+and the dashboard does not report a browser-display event. Therefore these
+metrics do not measure WebRTC transport latency or true phone-capture-to-
+browser-display latency. Laptop and phone wall clocks are not assumed
+synchronized; monotonic laptop durations cannot be subtracted from phone clock
+timestamps.
+
+The report captures laptop OS, Python, architecture, CPU information,
+Ultralytics version, model filename and SHA-256, mode, input resolution,
+confidence, device, tracker, and inference settings. Phone model/Android and
+Chrome versions, Wi-Fi conditions, and actual ICE/network route are not
+available to the server telemetry; record them with the run notes if known.
+Comparisons reject missing model digests, changed settings, warm-up/sample
+method differences, and incompatible environments. An absent navigation
+measurement remains `null`/unavailable, never zero. These measurements
+characterize laptop-side processing only; repeatability or a passing configured
+threshold does not establish speed, real-time suitability, or navigation
+safety.
+
 ## Python and installation
 
 The system Python in this workspace reports Python 3.14.6. The existing

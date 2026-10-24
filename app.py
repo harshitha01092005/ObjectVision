@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
 import logging
 import math
 import os
+import platform
 import struct
+import sys
 import threading
 import time
 import uuid
 import zlib
+from collections import deque
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +123,309 @@ class StreamState:
 
 
 STREAM = StreamState()
+
+
+class StreamTelemetry:
+    MAX_FRAME_SAMPLES = 1200
+    MAX_DASHBOARD_SAMPLES = 600
+    COUNTER_NAMES = (
+        "callback_frames_received",
+        "valid_decoded_frames",
+        "frames_received",
+        "frames_skipped",
+        "invalid_frames",
+        "decode_failures",
+        "accepted_for_processing",
+        "inference_throttled_frames",
+        "retry_suppressed_frames",
+        "processing_failures",
+        "successfully_processed_frames",
+        "snapshot_publications_completed",
+        "snapshot_publication_failures",
+        "dashboard_render_calls",
+        "dashboard_snapshot_reads",
+    )
+    MEASUREMENT_DEFINITIONS = {
+        "inference_latency_ms": (
+            "model.track() call duration, excluding model-lock wait"
+        ),
+        "navigation_evaluation_latency_ms": (
+            "NavigationEngine.evaluate() duration; null outside navigation modes"
+        ),
+        "frame_processing_latency_ms": (
+            "accepted processing start through operator-assistance generation; "
+            "excludes snapshot publication"
+        ),
+        "callback_to_snapshot_publication_ms": (
+            "recv callback entry through successful atomic snapshot replacement"
+        ),
+        "snapshot_publication_ms": (
+            "snapshot publication function entry through successful atomic "
+            "replacement, including JPEG encoding"
+        ),
+        "dashboard_snapshot_read_ms": (
+            "server-side read_snapshot file read and metadata parsing duration"
+        ),
+        "dashboard_render_call_ms": (
+            "server-side Streamlit fragment Python call duration; excludes browser paint"
+        ),
+    }
+    COUNTER_DEFINITIONS = {
+        "callback_frames_received": "recv callbacks observed for the active owner",
+        "valid_decoded_frames": "callbacks yielding a non-empty BGR frame",
+        "frames_received": "legacy count of valid frames counted after stream ownership check",
+        "frames_skipped": "legacy count of empty or invalid frames only",
+        "invalid_frames": "alias count for empty or invalid frames",
+        "decode_failures": "frame.to_ndarray exceptions",
+        "accepted_for_processing": "valid frames passing throttle and retry checks",
+        "inference_throttled_frames": "valid frames rejected by the 200 ms inference interval",
+        "retry_suppressed_frames": "valid frames rejected during model retry backoff",
+        "processing_failures": "accepted-frame exceptions before successful snapshot publication",
+        "successfully_processed_frames": "accepted frames with a published snapshot",
+        "snapshot_publications_completed": "successful atomic latest-snapshot replacements",
+        "snapshot_publication_failures": "snapshot publication exceptions",
+        "dashboard_render_calls": "server-side result view render function calls",
+        "dashboard_snapshot_reads": "server-side latest-snapshot reads",
+    }
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: str | None = None
+        self._generation = 0
+        self._started_ns: int | None = None
+        self._warmup_excluded = False
+        self._warmup_frames_excluded = 0
+        self._counters = {name: 0 for name in self.COUNTER_NAMES}
+        self._samples: deque[dict[str, Any]] = deque(
+            maxlen=self.MAX_FRAME_SAMPLES
+        )
+        self._dashboard_samples: deque[dict[str, Any]] = deque(
+            maxlen=self.MAX_DASHBOARD_SAMPLES
+        )
+
+    def start(self, owner: str, *, warmup_excluded: bool = False) -> None:
+        with self._lock:
+            warmup_frames = self._counters["callback_frames_received"]
+            self._owner = owner
+            self._generation += 1
+            self._started_ns = None
+            self._warmup_excluded = warmup_excluded
+            self._warmup_frames_excluded = (
+                warmup_frames if warmup_excluded else 0
+            )
+            self._counters = {name: 0 for name in self.COUNTER_NAMES}
+            self._samples.clear()
+            self._dashboard_samples.clear()
+
+    def begin_callback(self, owner: str, started_ns: int) -> int | None:
+        with self._lock:
+            if owner != self._owner:
+                return None
+            if self._started_ns is None:
+                self._started_ns = started_ns
+            self._counters["callback_frames_received"] += 1
+            return self._generation
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def increment(
+        self,
+        owner: str,
+        name: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            if owner != self._owner or (
+                generation is not None and generation != self._generation
+            ):
+                return
+            if name not in self._counters:
+                raise KeyError(f"Unknown stream telemetry counter: {name}")
+            self._counters[name] += 1
+
+    def record_snapshot(
+        self,
+        owner: str,
+        sample: dict[str, Any],
+        *,
+        callback_started_ns: int,
+        snapshot_started_ns: int,
+        published_ns: int,
+        generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            if owner != self._owner or (
+                generation is not None and generation != self._generation
+            ):
+                return
+            if self._started_ns is None:
+                self._started_ns = callback_started_ns
+            self._counters["successfully_processed_frames"] += 1
+            self._counters["snapshot_publications_completed"] += 1
+            sample["callback_to_snapshot_publication_ms"] = (
+                published_ns - callback_started_ns
+            ) / 1_000_000
+            sample["snapshot_publication_ms"] = (
+                published_ns - snapshot_started_ns
+            ) / 1_000_000
+            self._samples.append(sample)
+
+    def record_dashboard(
+        self,
+        *,
+        view: str,
+        stage: str,
+        elapsed_ms: float,
+        frame_id: int | None = None,
+        generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                return
+            if stage == "snapshot_read":
+                self._counters["dashboard_snapshot_reads"] += 1
+            elif stage == "render_call":
+                self._counters["dashboard_render_calls"] += 1
+                frame_id = None
+            self._dashboard_samples.append(
+                {
+                    "view": view,
+                    "stage": stage,
+                    "elapsed_ms": elapsed_ms,
+                    "frame_id": frame_id,
+                }
+            )
+
+    def export(self, *, now_ns: int | None = None) -> dict[str, Any]:
+        if now_ns is None:
+            now_ns = time.perf_counter_ns()
+        with self._lock:
+            elapsed_ns = (
+                now_ns - self._started_ns
+                if self._started_ns is not None
+                else None
+            )
+            elapsed_seconds = (
+                elapsed_ns / 1_000_000_000
+                if elapsed_ns is not None and elapsed_ns > 0
+                else None
+            )
+            counters = dict(self._counters)
+            frame_samples = [dict(sample) for sample in self._samples]
+            dashboard_samples = [
+                dict(sample) for sample in self._dashboard_samples
+            ]
+            warmup_excluded = self._warmup_excluded
+            warmup_frames_excluded = self._warmup_frames_excluded
+        model_digests: dict[str, str | None] = {}
+        for sample in frame_samples:
+            model_path = sample.pop("_model_path", None)
+            if model_path is not None:
+                if model_path not in model_digests:
+                    model_digests[model_path] = model_sha256(Path(model_path))
+                sample["model_sha256"] = model_digests[model_path]
+            else:
+                sample["model_sha256"] = None
+        rates = {
+            name: (
+                counters[counter] / elapsed_seconds
+                if elapsed_seconds is not None
+                else None
+            )
+            for name, counter in (
+                ("receive_rate_hz", "callback_frames_received"),
+                ("successful_processing_rate_hz", "successfully_processed_frames"),
+            )
+        }
+        return {
+            "schema_version": 1,
+            "source_type": "real_webrtc_phone_stream",
+            "transport": "WebRTC",
+            "capture_configuration": {
+                "facing_mode": "ideal environment",
+                "audio": False,
+                "signalling": "HTTPS",
+            },
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "environment": {
+                "os": platform.platform(),
+                "python": sys.version,
+                "architecture": platform.machine(),
+                "processor": platform.processor() or None,
+                "logical_cpu_count": os.cpu_count(),
+                "ultralytics": importlib.metadata.version("ultralytics"),
+            },
+            "elapsed_seconds": elapsed_seconds,
+            "rate_denominator_seconds": elapsed_seconds,
+            "warmup_excluded": warmup_excluded,
+            "warmup_frames_excluded": warmup_frames_excluded,
+            "measurement_definitions": self.MEASUREMENT_DEFINITIONS.copy(),
+            "counter_definitions": self.COUNTER_DEFINITIONS.copy(),
+            "counters": counters,
+            "rates": rates,
+            "samples": frame_samples,
+            "dashboard_samples": dashboard_samples,
+            "sample_retention": {
+                "frame_sample_capacity": self.MAX_FRAME_SAMPLES,
+                "dashboard_sample_capacity": self.MAX_DASHBOARD_SAMPLES,
+                "frame_samples_truncated": counters[
+                    "successfully_processed_frames"
+                ]
+                > len(frame_samples),
+                "dashboard_samples_truncated": counters[
+                    "dashboard_render_calls"
+                ]
+                + counters["dashboard_snapshot_reads"]
+                > len(dashboard_samples),
+            },
+        }
+
+
+STREAM_TELEMETRY = StreamTelemetry()
+
+
+def read_dashboard_snapshot(
+    mode: str, view: str
+) -> tuple[dict[str, Any], bytes] | None:
+    generation = STREAM_TELEMETRY.generation()
+    started_ns = time.perf_counter_ns()
+    snapshot = read_snapshot(mode)
+    elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
+    STREAM_TELEMETRY.record_dashboard(
+        view=view,
+        stage="snapshot_read",
+        elapsed_ms=elapsed_ms,
+        frame_id=snapshot[0].get("frame_id") if snapshot else None,
+        generation=generation,
+    )
+    return snapshot
+
+
+def measure_dashboard_render(view: str):
+    def decorate(render: Any):
+        @wraps(render)
+        def measured(*args: Any, **kwargs: Any):
+            generation = STREAM_TELEMETRY.generation()
+            started_ns = time.perf_counter_ns()
+            try:
+                return render(*args, **kwargs)
+            finally:
+                STREAM_TELEMETRY.record_dashboard(
+                    view=view,
+                    stage="render_call",
+                    elapsed_ms=(
+                        time.perf_counter_ns() - started_ns
+                    )
+                    / 1_000_000,
+                    generation=generation,
+                )
+
+        return measured
+
+    return decorate
 STATE_DIR = ROOT / ".stream_state"
 FRAME_PATH = STATE_DIR / "latest.jpg"
 METRICS_PATH = STATE_DIR / "metrics.json"
@@ -125,6 +435,22 @@ CAMERA_STATUS_PATH = STATE_DIR / "camera_status.json"
 NAVIGATION_CONFIG_PATH = STATE_DIR / "navigation_config.json"
 DEFAULT_CONFIDENCE = 0.35
 MODEL_LOCKS = {"custom": threading.Lock(), "coco": threading.Lock()}
+MODEL_DIGEST_LOCK = threading.Lock()
+MODEL_DIGEST_CACHE: dict[Path, str | None] = {}
+
+
+def model_sha256(path: Path) -> str | None:
+    with MODEL_DIGEST_LOCK:
+        if path not in MODEL_DIGEST_CACHE:
+            try:
+                digest = hashlib.sha256()
+                with path.open("rb") as model_file:
+                    for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                MODEL_DIGEST_CACHE[path] = digest.hexdigest()
+            except OSError:
+                return None
+        return MODEL_DIGEST_CACHE[path]
 
 
 def mode_snapshot_path(mode: str) -> Path:
@@ -595,6 +921,8 @@ class ObjectVideoProcessor(VideoProcessorBase):
     def __init__(self, owner: str) -> None:
         self.owner = owner
         self.allowed = acquire_camera(owner)
+        if self.allowed:
+            STREAM_TELEMETRY.start(owner)
         if not self.allowed:
             write_camera_status(
                 "Another phone camera stream is active. Stop that stream before connecting this one."
@@ -621,12 +949,22 @@ class ObjectVideoProcessor(VideoProcessorBase):
         self.history: dict[str, list[dict[str, Any]]] = {}
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        callback_started_ns = time.perf_counter_ns()
         frame_received_at = time.time()
         if not self.allowed:
             return frame
+        telemetry_generation = STREAM_TELEMETRY.begin_callback(
+            self.owner,
+            callback_started_ns,
+        )
         try:
             image = frame.to_ndarray(format="bgr24")
         except Exception as exc:
+            STREAM_TELEMETRY.increment(
+                self.owner,
+                "decode_failures",
+                generation=telemetry_generation,
+            )
             LOGGER.exception("Could not decode an incoming WebRTC video frame")
             mode_error(
                 read_active_mode(),
@@ -641,6 +979,16 @@ class ObjectVideoProcessor(VideoProcessorBase):
             or image.shape[2] != 3
         ):
             self.frames_skipped += 1
+            STREAM_TELEMETRY.increment(
+                self.owner,
+                "frames_skipped",
+                generation=telemetry_generation,
+            )
+            STREAM_TELEMETRY.increment(
+                self.owner,
+                "invalid_frames",
+                generation=telemetry_generation,
+            )
             LOGGER.error("Received an empty or invalid WebRTC video frame")
             mode_error(
                 read_active_mode(),
@@ -648,6 +996,11 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 "Received an empty or invalid video frame.",
             )
             return frame
+        STREAM_TELEMETRY.increment(
+            self.owner,
+            "valid_decoded_frames",
+            generation=telemetry_generation,
+        )
         quality = analyze_image_quality(image)
         motion = estimate_camera_motion(self.previous_frame, image)
 
@@ -658,6 +1011,11 @@ class ObjectVideoProcessor(VideoProcessorBase):
             STREAM.frames += 1
             frame_id = STREAM.frames
         self.frames_received += 1
+        STREAM_TELEMETRY.increment(
+            self.owner,
+            "frames_received",
+            generation=telemetry_generation,
+        )
         if self.frames_received == 1 or self.frames_received % 60 == 0:
             LOGGER.info(
                 "Received WebRTC video frame id=%s size=%sx%s",
@@ -674,6 +1032,11 @@ class ObjectVideoProcessor(VideoProcessorBase):
             self.active_mode = mode
             self.navigation_engine.reset()
         if frame_received_at - self.last_inference_at < 0.2:
+            STREAM_TELEMETRY.increment(
+                self.owner,
+                "inference_throttled_frames",
+                generation=telemetry_generation,
+            )
             if frame_received_at - self.last_status_at >= 0.5:
                 self.last_status_at = frame_received_at
                 write_camera_status(
@@ -689,6 +1052,11 @@ class ObjectVideoProcessor(VideoProcessorBase):
 
         confidence = read_confidence()
         if time.time() < self.model_retry_after.get(mode, 0):
+            STREAM_TELEMETRY.increment(
+                self.owner,
+                "retry_suppressed_frames",
+                generation=telemetry_generation,
+            )
             return av.VideoFrame.from_ndarray(image, format="bgr24")
         self.last_inference_at = frame_received_at
         write_camera_status(
@@ -700,8 +1068,15 @@ class ObjectVideoProcessor(VideoProcessorBase):
             last_frame_received_at=frame_received_at,
             inference_status="running",
         )
+        STREAM_TELEMETRY.increment(
+            self.owner,
+            "accepted_for_processing",
+            generation=telemetry_generation,
+        )
         # Covers accepted inference through assistance; skipped and failed frames publish no metrics.
         processing_started_ns = time.perf_counter_ns()
+        snapshot_started_ns: int | None = None
+        snapshot_published = False
         try:
             if mode in {"coco", "navigation"}:
                 config = read_navigation_config()
@@ -902,7 +1277,55 @@ class ObjectVideoProcessor(VideoProcessorBase):
             if navigation_result is not None:
                 metrics["navigation"] = navigation_result.to_dict()
             self.previous_frame = image.copy()
+            snapshot_started_ns = time.perf_counter_ns()
             write_snapshot(mode, annotated, metrics)
+            snapshot_published = True
+            published_ns = time.perf_counter_ns()
+            STREAM_TELEMETRY.record_snapshot(
+                self.owner,
+                {
+                    "frame_id": frame_id,
+                    "mode": mode,
+                    "resolution": {
+                        "width": int(image.shape[1]),
+                        "height": int(image.shape[0]),
+                    },
+                    "confidence": confidence,
+                    "model_name": Path(
+                        str(
+                            getattr(
+                                self.tracking_model,
+                                "ckpt_path",
+                                None,
+                            )
+                            or (MODEL_PATH if mode == "custom" else COCO_MODEL_PATH)
+                        )
+                    ).name,
+                    "_model_path": str(
+                        getattr(
+                            self.tracking_model,
+                            "ckpt_path",
+                            None,
+                        )
+                        or (MODEL_PATH if mode == "custom" else COCO_MODEL_PATH)
+                    ),
+                    "device": "cpu",
+                    "tracker": self.detection_stability_config.tracker_config,
+                    "persist": True,
+                    "imgsz": "Ultralytics default; not explicitly passed",
+                    "inference_latency_ms": metrics["inference_latency_ms"],
+                    "navigation_evaluation_latency_ms": metrics[
+                        "navigation_evaluation_latency_ms"
+                    ],
+                    "frame_processing_latency_ms": metrics[
+                        "frame_processing_latency_ms"
+                    ],
+                },
+                callback_started_ns=callback_started_ns,
+                snapshot_started_ns=snapshot_started_ns,
+                published_ns=published_ns,
+                generation=telemetry_generation,
+            )
             self.model_retry_after.pop(mode, None)
             write_camera_status(
                 (
@@ -927,6 +1350,18 @@ class ObjectVideoProcessor(VideoProcessorBase):
             )
             return av.VideoFrame.from_ndarray(annotated, format="bgr24")
         except Exception as exc:
+            if not snapshot_published:
+                STREAM_TELEMETRY.increment(
+                    self.owner,
+                    "processing_failures",
+                    generation=telemetry_generation,
+                )
+            if snapshot_started_ns is not None and not snapshot_published:
+                STREAM_TELEMETRY.increment(
+                    self.owner,
+                    "snapshot_publication_failures",
+                    generation=telemetry_generation,
+                )
             LOGGER.exception(
                 "Failed to process WebRTC frame id=%s in mode=%s", frame_id, mode
             )
@@ -1058,6 +1493,35 @@ def show_camera_status(
         st.info("Camera stream is stopped. Tap START on the phone to reconnect.")
     else:
         st.info(f"Waiting for phone camera connection. {text}")
+    if owner:
+        if st.button(
+            "Reset telemetry after warm-up",
+            help="Clear session counts and timing samples; the next received frame starts the measured interval.",
+            key="reset-stream-telemetry",
+        ):
+            STREAM_TELEMETRY.start(owner, warmup_excluded=True)
+            st.session_state.pop("stream-telemetry-export", None)
+        if st.button(
+            "Prepare telemetry export",
+            key="prepare-stream-telemetry",
+        ):
+            st.session_state["stream-telemetry-export"] = json.dumps(
+                STREAM_TELEMETRY.export(),
+                indent=2,
+                allow_nan=False,
+            )
+        telemetry_export = st.session_state.get("stream-telemetry-export")
+        if telemetry_export:
+            st.download_button(
+                "Download current stream telemetry",
+                data=telemetry_export,
+                file_name="objectvision-real-stream-telemetry.json",
+                mime="application/json",
+                key="download-stream-telemetry",
+            )
+        st.caption(
+            "Telemetry contains bounded timing samples and counts only; it does not save camera frames."
+        )
 
 
 def show_phone_view() -> None:
@@ -1145,8 +1609,9 @@ def render_stream_health(mode: str, metrics: dict[str, Any] | None) -> None:
 
 
 @st.fragment(run_every="1s")
+@measure_dashboard_render("dashboard")
 def show_dashboard() -> None:
-    snapshot = read_snapshot("custom")
+    snapshot = read_dashboard_snapshot("custom", "dashboard")
     if snapshot is None:
         render_stream_health("custom", None)
         st.warning("No custom-model camera results yet.")
@@ -1221,8 +1686,9 @@ def show_dashboard() -> None:
 
 
 @st.fragment(run_every="1s")
+@measure_dashboard_render("coco")
 def show_coco_view() -> None:
-    snapshot = read_snapshot("coco")
+    snapshot = read_dashboard_snapshot("coco", "coco")
     if snapshot is None:
         render_stream_health("coco", None)
         st.warning(
@@ -1270,8 +1736,9 @@ def show_coco_view() -> None:
 
 
 @st.fragment(run_every="1s")
+@measure_dashboard_render("live")
 def show_live_detection_view(mode: str) -> None:
-    snapshot = read_snapshot(mode)
+    snapshot = read_dashboard_snapshot(mode, "live")
     left_panel, right_panel = st.columns([1.15, 1], gap="large")
     metrics: dict[str, Any] | None = None
     navigation: dict[str, Any] | None = None
@@ -1509,8 +1976,9 @@ def render_navigation_controls() -> None:
 
 
 @st.fragment(run_every="1s")
+@measure_dashboard_render("navigation")
 def show_navigation_view() -> None:
-    snapshot = read_snapshot("navigation")
+    snapshot = read_dashboard_snapshot("navigation", "navigation")
     if snapshot is None:
         render_stream_health("navigation", None)
         st.warning(

@@ -19,11 +19,13 @@ from benchmark_latency import (
     _arguments,
     analyze_repeatability,
     add_threshold_validation,
+    build_real_stream_report,
     deterministic_frame,
     load_benchmark_reports,
     main,
     parse_positive_finite_float,
     parse_resolution,
+    REAL_STREAM_MEASUREMENT_DEFINITIONS,
     summarize_timings,
     validate_latency_thresholds,
     write_report,
@@ -100,6 +102,129 @@ def _change_measured_count(report: dict) -> None:
         if summary["sample_count"]:
             summary["sample_count"] = 5
         summary["unavailable_samples"] = 5 - summary["sample_count"]
+
+
+def _stream_telemetry(
+    *,
+    confidence: float = 0.35,
+    inference: float = 10.0,
+    include_navigation: bool = True,
+    elapsed: float = 2.0,
+) -> dict:
+    counters = {
+        "callback_frames_received": 10,
+        "valid_decoded_frames": 9,
+        "frames_received": 9,
+        "frames_skipped": 1,
+        "invalid_frames": 1,
+        "decode_failures": 0,
+        "accepted_for_processing": 5,
+        "inference_throttled_frames": 3,
+        "retry_suppressed_frames": 1,
+        "processing_failures": 2,
+        "successfully_processed_frames": 3,
+        "snapshot_publications_completed": 3,
+        "snapshot_publication_failures": 0,
+        "dashboard_render_calls": 1,
+        "dashboard_snapshot_reads": 1,
+    }
+    samples = []
+    for frame_id in range(3):
+        samples.append(
+            {
+                "frame_id": frame_id + 1,
+                "mode": "navigation",
+                "resolution": {"width": 640, "height": 480},
+                "confidence": confidence,
+                "model_name": "yolov8n.pt",
+                "model_sha256": "a" * 64,
+                "device": "cpu",
+                "tracker": "objectvision_bytetrack.yaml",
+                "persist": True,
+                "imgsz": "Ultralytics default; not explicitly passed",
+                "inference_latency_ms": inference + frame_id,
+                "navigation_evaluation_latency_ms": (
+                    2.0 + frame_id if include_navigation else None
+                ),
+                "frame_processing_latency_ms": 20.0 + frame_id,
+                "callback_to_snapshot_publication_ms": 30.0 + frame_id,
+                "snapshot_publication_ms": 1.0 + frame_id,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "source_type": "real_webrtc_phone_stream",
+        "transport": "WebRTC",
+        "generated_at_utc": "2026-10-24T00:00:00+00:00",
+        "environment": {
+            "os": "test-os",
+            "python": "3.12",
+            "architecture": "test-arch",
+            "processor": "test-cpu",
+            "logical_cpu_count": 8,
+            "ultralytics": "test-version",
+        },
+        "capture_configuration": {
+            "facing_mode": "ideal environment",
+            "audio": False,
+            "signalling": "HTTPS",
+        },
+        "elapsed_seconds": elapsed,
+        "rate_denominator_seconds": elapsed,
+        "warmup_excluded": True,
+        "warmup_frames_excluded": 10,
+        "measurement_definitions": {
+            **REAL_STREAM_MEASUREMENT_DEFINITIONS,
+        },
+        "counter_definitions": {
+            "callback_frames_received": "recv callbacks observed for the active owner",
+            "valid_decoded_frames": "callbacks yielding a non-empty BGR frame",
+            "frames_received": (
+                "legacy count of valid frames counted after stream ownership check"
+            ),
+            "frames_skipped": "legacy count of empty or invalid frames only",
+            "invalid_frames": "alias count for empty or invalid frames",
+            "decode_failures": "frame.to_ndarray exceptions",
+            "accepted_for_processing": "valid frames passing throttle and retry checks",
+            "inference_throttled_frames": "valid frames rejected by the 200 ms inference interval",
+            "retry_suppressed_frames": "valid frames rejected during model retry backoff",
+            "processing_failures": "accepted-frame exceptions before successful snapshot publication",
+            "successfully_processed_frames": "accepted frames with a published snapshot",
+            "snapshot_publications_completed": "successful atomic latest-snapshot replacements",
+            "snapshot_publication_failures": "snapshot publication exceptions",
+            "dashboard_render_calls": "server-side result view render function calls",
+            "dashboard_snapshot_reads": "server-side latest-snapshot reads",
+        },
+        "counters": counters,
+        "rates": {
+            "receive_rate_hz": counters["callback_frames_received"] / elapsed,
+            "successful_processing_rate_hz": counters[
+                "successfully_processed_frames"
+            ]
+            / elapsed,
+        },
+        "samples": samples,
+        "dashboard_samples": [
+            {
+                "view": "navigation",
+                "stage": "snapshot_read",
+                "elapsed_ms": 1.0,
+                "frame_id": 3,
+            },
+            {
+                "view": "navigation",
+                "stage": "render_call",
+                "elapsed_ms": 4.0,
+                "frame_id": None,
+            },
+        ],
+        "sample_retention": {
+            "frame_sample_capacity": 1200,
+            "dashboard_sample_capacity": 600,
+            "frame_samples_truncated": False,
+            "dashboard_samples_truncated": False,
+        },
+    }
 
 
 class LatencyBenchmarkTests(unittest.TestCase):
@@ -421,6 +546,258 @@ class LatencyBenchmarkTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Could not read benchmark report"):
                 load_benchmark_reports([report_path])
+
+    def test_real_stream_telemetry_builds_rates_and_latency_summaries(self) -> None:
+        report = build_real_stream_report(_stream_telemetry())
+
+        self.assertEqual(report["input"]["kind"], "real_webrtc_phone_stream")
+        self.assertEqual(
+            report["method"]["measurement_definitions"],
+            REAL_STREAM_MEASUREMENT_DEFINITIONS,
+        )
+        self.assertEqual(report["latency"]["inference_latency_ms"]["sample_count"], 3)
+        self.assertEqual(report["latency"]["snapshot_publication_ms"]["p95_ms"], 3.0)
+        self.assertEqual(
+            report["stream_telemetry"]["rates"]["receive_rate_hz"],
+            5.0,
+        )
+        self.assertEqual(
+            report["dashboard_latency"]["dashboard_render_call_ms"]["p50_ms"],
+            4.0,
+        )
+
+    def test_real_stream_telemetry_rejects_noncanonical_timing_definitions(self) -> None:
+        incorrect = _stream_telemetry()
+        incorrect["measurement_definitions"][
+            "frame_processing_latency_ms"
+        ] = "includes snapshot publication"
+        with self.assertRaisesRegex(ValueError, "changes measurement definitions"):
+            build_real_stream_report(incorrect)
+
+        missing = _stream_telemetry()
+        missing["measurement_definitions"].pop("snapshot_publication_ms")
+        with self.assertRaisesRegex(ValueError, "changes measurement definitions"):
+            build_real_stream_report(missing)
+
+        malformed = _stream_telemetry()
+        malformed["measurement_definitions"]["dashboard_render_call_ms"] = 42
+        with self.assertRaisesRegex(ValueError, "changes measurement definitions"):
+            build_real_stream_report(malformed)
+
+        valid_report = build_real_stream_report(_stream_telemetry())
+        mismatched_report = copy.deepcopy(valid_report)
+        mismatched_report["method"]["measurement_definitions"][
+            "snapshot_publication_ms"
+        ] = "excludes JPEG encoding"
+        with self.assertRaisesRegex(
+            ValueError, "invalid real-stream measurement definitions"
+        ):
+            analyze_repeatability([valid_report, mismatched_report])
+
+    def test_real_stream_telemetry_keeps_missing_navigation_unavailable(self) -> None:
+        report = build_real_stream_report(
+            _stream_telemetry(include_navigation=False)
+        )
+        navigation = report["latency"]["navigation_evaluation_latency_ms"]
+
+        self.assertEqual(navigation["sample_count"], 0)
+        self.assertEqual(navigation["unavailable_samples"], 3)
+        self.assertIsNone(navigation["p50_ms"])
+        self.assertIsNone(navigation["p95_ms"])
+
+    def test_real_stream_telemetry_rejects_invalid_counters_and_denominators(self) -> None:
+        invalid_counter = _stream_telemetry()
+        invalid_counter["counters"]["frames_skipped"] = 0
+        with self.assertRaisesRegex(ValueError, "legacy frames_skipped"):
+            build_real_stream_report(invalid_counter)
+
+        malformed_counter = _stream_telemetry()
+        malformed_counter["counters"]["successfully_processed_frames"] = "3"
+        with self.assertRaisesRegex(ValueError, "successful-frame counter"):
+            build_real_stream_report(malformed_counter)
+
+        overcounted_decode_paths = _stream_telemetry()
+        overcounted_decode_paths["counters"]["valid_decoded_frames"] = 10
+        with self.assertRaisesRegex(ValueError, "inconsistent stream counters"):
+            build_real_stream_report(overcounted_decode_paths)
+
+        overcounted_processing_paths = _stream_telemetry()
+        overcounted_processing_paths["counters"]["inference_throttled_frames"] = 4
+        with self.assertRaisesRegex(ValueError, "inconsistent stream counters"):
+            build_real_stream_report(overcounted_processing_paths)
+
+        invalid_denominator = _stream_telemetry()
+        invalid_denominator["rate_denominator_seconds"] = 3.0
+        with self.assertRaisesRegex(ValueError, "denominator"):
+            build_real_stream_report(invalid_denominator)
+
+        invalid_rates = _stream_telemetry()
+        invalid_rates["rates"]["receive_rate_hz"] = 0
+        with self.assertRaisesRegex(ValueError, "receive_rate_hz"):
+            build_real_stream_report(invalid_rates)
+
+    def test_real_stream_telemetry_validates_retention_flags_against_counts(self) -> None:
+        invalid_frame_retention = _stream_telemetry()
+        invalid_frame_retention["sample_retention"][
+            "frame_samples_truncated"
+        ] = True
+        with self.assertRaisesRegex(ValueError, "sample-retention flags"):
+            build_real_stream_report(invalid_frame_retention)
+
+        invalid_dashboard_retention = _stream_telemetry()
+        invalid_dashboard_retention["sample_retention"][
+            "dashboard_samples_truncated"
+        ] = True
+        with self.assertRaisesRegex(ValueError, "sample-retention flags"):
+            build_real_stream_report(invalid_dashboard_retention)
+
+        truncated_frames = _stream_telemetry()
+        counters = truncated_frames["counters"]
+        counters.update(
+            callback_frames_received=11,
+            valid_decoded_frames=10,
+            frames_received=10,
+            accepted_for_processing=6,
+            successfully_processed_frames=4,
+            snapshot_publications_completed=4,
+        )
+        truncated_frames["rates"].update(
+            receive_rate_hz=5.5,
+            successful_processing_rate_hz=2.0,
+        )
+        truncated_frames["sample_retention"]["frame_samples_truncated"] = True
+
+        report = build_real_stream_report(truncated_frames)
+
+        self.assertEqual(report["method"]["measured_frames"], 3)
+        self.assertTrue(
+            report["stream_telemetry"]["sample_retention"][
+                "frame_samples_truncated"
+            ]
+        )
+
+    def test_real_stream_reports_require_valid_telemetry_for_repeatability(self) -> None:
+        real_report = build_real_stream_report(_stream_telemetry())
+        missing_telemetry = dict(real_report)
+        missing_telemetry.pop("stream_telemetry")
+        with self.assertRaisesRegex(ValueError, "missing stream telemetry"):
+            analyze_repeatability([missing_telemetry, real_report])
+
+        malformed_telemetry = dict(real_report)
+        malformed_telemetry["stream_telemetry"] = dict(
+            real_report["stream_telemetry"]
+        )
+        malformed_telemetry["stream_telemetry"]["counters"] = dict(
+            real_report["stream_telemetry"]["counters"]
+        )
+        malformed_telemetry["stream_telemetry"]["counters"].pop("frames_received")
+        with self.assertRaisesRegex(ValueError, "missing stream counters"):
+            analyze_repeatability([real_report, malformed_telemetry])
+
+    def test_real_stream_telemetry_rejects_mixed_settings_and_invalid_reports(self) -> None:
+        mixed = _stream_telemetry()
+        mixed["samples"][1]["confidence"] = 0.5
+        with self.assertRaisesRegex(ValueError, "mixed frame configurations"):
+            build_real_stream_report(mixed)
+
+        invalid_sample = _stream_telemetry()
+        invalid_sample["samples"][0]["snapshot_publication_ms"] = math.inf
+        with self.assertRaisesRegex(ValueError, "Invalid snapshot_publication_ms"):
+            build_real_stream_report(invalid_sample)
+
+        invalid_source = _stream_telemetry()
+        invalid_source["source_type"] = "synthetic"
+        with self.assertRaisesRegex(ValueError, "source_type"):
+            build_real_stream_report(invalid_source)
+
+        not_warmed = _stream_telemetry()
+        not_warmed["warmup_excluded"] = False
+        with self.assertRaisesRegex(ValueError, "Reset telemetry after stream warm-up"):
+            build_real_stream_report(not_warmed)
+
+    def test_real_stream_repeatability_requires_matching_configuration(self) -> None:
+        first = build_real_stream_report(_stream_telemetry(inference=10.0))
+        second = build_real_stream_report(_stream_telemetry(inference=12.0))
+        analysis = analyze_repeatability([first, second])
+
+        self.assertEqual(analysis["run_count"], 2)
+        self.assertEqual(
+            analysis["throughput"]["receive_rate_hz"]["runs"][0]["rate_hz"],
+            5.0,
+        )
+        self.assertEqual(
+            analysis["throughput"]["receive_rate_hz"]["across_run_range_hz"],
+            0.0,
+        )
+        self.assertEqual(
+            analysis["metrics"]["snapshot_publication_ms"][
+                "across_run_variability"
+            ]["p95_range_ms"],
+            0.0,
+        )
+        self.assertEqual(
+            analysis["dashboard_metrics"]["dashboard_render_call_ms"]["runs"][0][
+                "p50_ms"
+            ],
+            4.0,
+        )
+
+        mismatched = build_real_stream_report(
+            _stream_telemetry(confidence=0.5)
+        )
+        with self.assertRaisesRegex(ValueError, "configuration differs"):
+            analyze_repeatability([first, mismatched])
+        changed_definition = build_real_stream_report(_stream_telemetry())
+        changed_definition["method"]["measurement_definitions"][
+            "snapshot_publication_ms"
+        ] = "different boundary"
+        with self.assertRaisesRegex(
+            ValueError, "invalid real-stream measurement definitions"
+        ):
+            analyze_repeatability([first, changed_definition])
+        changed_dashboard = build_real_stream_report(_stream_telemetry())
+        changed_dashboard["method"]["dashboard_views_measured"] = ["custom"]
+        with self.assertRaisesRegex(ValueError, "configuration differs in: method"):
+            analyze_repeatability([first, changed_dashboard])
+
+    def test_real_stream_without_model_digest_is_reportable_but_not_comparable(self) -> None:
+        telemetry = _stream_telemetry()
+        for sample in telemetry["samples"]:
+            sample["model_sha256"] = None
+
+        report = build_real_stream_report(telemetry)
+
+        self.assertIsNone(report["inference"]["model_sha256"])
+        with self.assertRaisesRegex(ValueError, "without a model SHA-256 digest"):
+            analyze_repeatability([report, report])
+
+    def test_real_stream_telemetry_cli_reads_export_without_running_benchmark(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            directory = Path(temporary_dir)
+            telemetry_path = directory / "telemetry.json"
+            output_path = directory / "summary.json"
+            telemetry_path.write_text(
+                json.dumps(_stream_telemetry()),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "sys.argv",
+                [
+                    "benchmark_latency.py",
+                    "--telemetry",
+                    str(telemetry_path),
+                    "--output",
+                    str(output_path),
+                ],
+            ):
+                main()
+
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["benchmark"],
+                "ObjectVision real WebRTC stream performance telemetry",
+            )
 
     def test_resolution_parser_requires_positive_width_and_height(self) -> None:
         self.assertEqual(parse_resolution("640x480"), (640, 480))

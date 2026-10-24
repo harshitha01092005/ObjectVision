@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import math
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import av
 import numpy as np
 
 import app
+from benchmark_latency import build_real_stream_report
 
 
 class Values:
@@ -220,12 +223,15 @@ class StreamPipelineTests(unittest.TestCase):
     def test_processor_publishes_monotonic_stage_durations(self) -> None:
         clock_values = iter(
             (
+                0,
                 1_000_000_000,
                 2_000_000_000,
                 2_125_000_000,
                 3_000_000_000,
                 3_010_000_000,
                 4_000_000_000,
+                5_000_000_000,
+                5_200_000_000,
             )
         )
         with patch.object(
@@ -252,9 +258,28 @@ class StreamPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["inference_latency_ms"], 125.0)
         self.assertEqual(metrics["navigation_evaluation_latency_ms"], 10.0)
         self.assertEqual(metrics["frame_processing_latency_ms"], 3000.0)
+        telemetry = app.STREAM_TELEMETRY.export(now_ns=6_000_000_000)
+        self.assertEqual(
+            telemetry["samples"][0]["callback_to_snapshot_publication_ms"],
+            5200.0,
+        )
+        self.assertEqual(
+            telemetry["samples"][0]["snapshot_publication_ms"],
+            200.0,
+        )
+        self.assertEqual(telemetry["samples"][0]["frame_id"], metrics["frame_id"])
+        self.assertEqual(telemetry["rates"]["receive_rate_hz"], 1 / 6)
+        self.assertEqual(
+            telemetry["rates"]["successful_processing_rate_hz"],
+            1 / 6,
+        )
+        self.assertEqual(
+            telemetry["counters"]["snapshot_publications_completed"],
+            1,
+        )
 
     def test_non_navigation_mode_reports_navigation_duration_as_unavailable(self) -> None:
-        with patch.object(app.time, "perf_counter_ns", side_effect=range(6)):
+        with patch.object(app.time, "perf_counter_ns", side_effect=range(8)):
             _, snapshots, _ = self.run_processor(
                 "custom",
                 include_person=True,
@@ -566,6 +591,269 @@ class StreamPipelineTests(unittest.TestCase):
 
         self.assertEqual(model.calls, 0)
         self.assertIsInstance(output, FakeFrame)
+        telemetry = app.STREAM_TELEMETRY.export()
+        self.assertEqual(telemetry["counters"]["callback_frames_received"], 1)
+        self.assertEqual(telemetry["counters"]["invalid_frames"], 1)
+        self.assertEqual(telemetry["counters"]["frames_skipped"], 1)
+        self.assertEqual(telemetry["samples"], [])
+
+    def test_stream_telemetry_counts_throttle_retry_and_processing_failure(self) -> None:
+        model = FakeModel(include_person=True)
+        with (
+            patch.object(app, "acquire_camera", return_value=True),
+            patch.object(app, "read_active_mode", return_value="custom"),
+            patch.object(app, "read_confidence", return_value=0.35),
+            patch.object(app, "get_mode_model", return_value=model),
+            patch.object(app, "write_camera_status"),
+            patch.object(app, "mode_error"),
+            patch.object(app, "write_snapshot"),
+        ):
+            processor = app.ObjectVideoProcessor(self.owner)
+            processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
+            processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
+            processor.last_inference_at = 0
+            processor.model_retry_after["custom"] = app.time.time() + 30
+            processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
+            processor.model_retry_after.clear()
+            processor.last_inference_at = 0
+            model.track = Mock(side_effect=RuntimeError("inference failed"))  # type: ignore[method-assign]
+            processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
+
+        counters = app.STREAM_TELEMETRY.export()["counters"]
+        self.assertEqual(counters["callback_frames_received"], 4)
+        self.assertEqual(counters["valid_decoded_frames"], 4)
+        self.assertEqual(counters["frames_received"], 4)
+        self.assertEqual(counters["accepted_for_processing"], 2)
+        self.assertEqual(counters["inference_throttled_frames"], 1)
+        self.assertEqual(counters["retry_suppressed_frames"], 1)
+        self.assertEqual(counters["processing_failures"], 1)
+        self.assertEqual(counters["successfully_processed_frames"], 1)
+        self.assertEqual(counters["snapshot_publications_completed"], 1)
+
+    def test_stream_telemetry_records_decode_failure_separately(self) -> None:
+        class BrokenFrame:
+            def to_ndarray(self, *, format: str) -> np.ndarray:
+                raise RuntimeError("decode failed")
+
+        with (
+            patch.object(app, "acquire_camera", return_value=True),
+            patch.object(app, "read_active_mode", return_value="custom"),
+            patch.object(app, "write_camera_status"),
+            patch.object(app, "mode_error"),
+        ):
+            processor = app.ObjectVideoProcessor(self.owner)
+            processor.recv(BrokenFrame())  # type: ignore[arg-type]
+
+        counters = app.STREAM_TELEMETRY.export()["counters"]
+        self.assertEqual(counters["callback_frames_received"], 1)
+        self.assertEqual(counters["decode_failures"], 1)
+        self.assertEqual(counters["processing_failures"], 0)
+        self.assertEqual(counters["frames_skipped"], 0)
+
+    def test_snapshot_publication_failure_is_not_counted_as_success(self) -> None:
+        model = FakeModel(include_person=True)
+        with (
+            patch.object(app, "acquire_camera", return_value=True),
+            patch.object(app, "read_active_mode", return_value="custom"),
+            patch.object(app, "read_confidence", return_value=0.35),
+            patch.object(app, "get_mode_model", return_value=model),
+            patch.object(app, "write_camera_status"),
+            patch.object(app, "mode_error"),
+            patch.object(
+                app,
+                "write_snapshot",
+                side_effect=OSError("snapshot write failed"),
+            ),
+        ):
+            processor = app.ObjectVideoProcessor(self.owner)
+            processor.recv(FakeFrame(self.image))  # type: ignore[arg-type]
+
+        counters = app.STREAM_TELEMETRY.export()["counters"]
+        self.assertEqual(counters["accepted_for_processing"], 1)
+        self.assertEqual(counters["processing_failures"], 1)
+        self.assertEqual(counters["snapshot_publication_failures"], 1)
+        self.assertEqual(counters["snapshot_publications_completed"], 0)
+        self.assertEqual(counters["successfully_processed_frames"], 0)
+
+    def test_stream_telemetry_counter_updates_are_thread_safe_and_bounded(self) -> None:
+        telemetry = app.StreamTelemetry()
+        telemetry.start(self.owner)
+        threads = [
+            threading.Thread(
+                target=lambda: [
+                    telemetry.increment(self.owner, "valid_decoded_frames")
+                    for _ in range(500)
+                ]
+            )
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for frame_id in range(telemetry.MAX_FRAME_SAMPLES + 10):
+            telemetry.record_snapshot(
+                self.owner,
+                {"frame_id": frame_id},
+                callback_started_ns=1,
+                snapshot_started_ns=2,
+                published_ns=3,
+            )
+
+        exported = telemetry.export(now_ns=10)
+
+        self.assertEqual(exported["counters"]["valid_decoded_frames"], 4000)
+        self.assertEqual(
+            exported["counters"]["successfully_processed_frames"],
+            telemetry.MAX_FRAME_SAMPLES + 10,
+        )
+        self.assertEqual(len(exported["samples"]), telemetry.MAX_FRAME_SAMPLES)
+        self.assertTrue(exported["sample_retention"]["frame_samples_truncated"])
+        self.assertEqual(exported["samples"][0]["frame_id"], 10)
+        for index in range(telemetry.MAX_DASHBOARD_SAMPLES + 5):
+            telemetry.record_dashboard(
+                view="navigation",
+                stage="snapshot_read",
+                elapsed_ms=float(index),
+                frame_id=index,
+            )
+        dashboard_export = telemetry.export(now_ns=11)
+        self.assertEqual(
+            len(dashboard_export["dashboard_samples"]),
+            telemetry.MAX_DASHBOARD_SAMPLES,
+        )
+        self.assertTrue(
+            dashboard_export["sample_retention"]["dashboard_samples_truncated"]
+        )
+
+    def test_stream_telemetry_reset_discards_inflight_old_generation(self) -> None:
+        telemetry = app.StreamTelemetry()
+        telemetry.start(self.owner)
+        old_generation = telemetry.begin_callback(self.owner, 100)
+        telemetry.start(self.owner, warmup_excluded=True)
+        telemetry.increment(
+            self.owner,
+            "valid_decoded_frames",
+            generation=old_generation,
+        )
+
+        exported = telemetry.export(now_ns=200)
+
+        self.assertEqual(exported["counters"]["callback_frames_received"], 0)
+        self.assertEqual(exported["counters"]["valid_decoded_frames"], 0)
+        self.assertTrue(exported["warmup_excluded"])
+        self.assertIsNone(exported["rates"]["receive_rate_hz"])
+
+    def test_exported_stream_telemetry_is_accepted_by_report_importer(self) -> None:
+        telemetry = app.StreamTelemetry()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            model_path = Path(temporary_dir) / "model.pt"
+            model_path.write_bytes(b"test-model-weights")
+            telemetry.start(self.owner)
+            telemetry.begin_callback(self.owner, 10)
+            telemetry.begin_callback(self.owner, 20)
+            telemetry.start(self.owner, warmup_excluded=True)
+            generation = telemetry.begin_callback(self.owner, 1_000_000_000)
+            telemetry.increment(
+                self.owner,
+                "valid_decoded_frames",
+                generation=generation,
+            )
+            telemetry.increment(
+                self.owner,
+                "frames_received",
+                generation=generation,
+            )
+            telemetry.increment(
+                self.owner,
+                "accepted_for_processing",
+                generation=generation,
+            )
+            telemetry.record_snapshot(
+                self.owner,
+                {
+                    "frame_id": 7,
+                    "mode": "navigation",
+                    "resolution": {"width": 640, "height": 480},
+                    "confidence": 0.35,
+                    "model_name": "model.pt",
+                    "_model_path": str(model_path),
+                    "device": "cpu",
+                    "tracker": "objectvision_bytetrack.yaml",
+                    "persist": True,
+                    "imgsz": "Ultralytics default; not explicitly passed",
+                    "inference_latency_ms": 10.0,
+                    "navigation_evaluation_latency_ms": None,
+                    "frame_processing_latency_ms": 20.0,
+                },
+                callback_started_ns=1_000_000_000,
+                snapshot_started_ns=1_100_000_000,
+                published_ns=1_200_000_000,
+                generation=generation,
+            )
+            exported = telemetry.export(now_ns=2_000_000_000)
+
+        report = build_real_stream_report(exported)
+
+        self.assertEqual(report["method"]["warmup_frames"], 2)
+        self.assertIsNone(
+            report["latency"]["navigation_evaluation_latency_ms"]["p95_ms"]
+        )
+        self.assertEqual(report["stream_telemetry"]["rates"]["receive_rate_hz"], 1.0)
+        self.assertEqual(
+            report["inference"]["model_sha256"],
+            hashlib.sha256(b"test-model-weights").hexdigest(),
+        )
+
+    def test_dashboard_server_timing_is_recorded_separately(self) -> None:
+        telemetry = app.StreamTelemetry()
+        with (
+            patch.object(app, "STREAM_TELEMETRY", telemetry),
+            patch.object(app, "read_snapshot", return_value=({"frame_id": 18}, b"jpg")),
+            patch.object(app.time, "perf_counter_ns", side_effect=(10, 110, 200, 350)),
+        ):
+            snapshot = app.read_dashboard_snapshot("coco", "coco")
+            rendered = app.measure_dashboard_render("coco")(lambda: "rendered")()
+
+        self.assertEqual(snapshot, ({"frame_id": 18}, b"jpg"))
+        self.assertEqual(rendered, "rendered")
+        samples = telemetry.export()["dashboard_samples"]
+        self.assertEqual(samples[0]["stage"], "snapshot_read")
+        self.assertEqual(samples[0]["elapsed_ms"], 0.0001)
+        self.assertEqual(samples[0]["frame_id"], 18)
+        self.assertEqual(samples[1]["stage"], "render_call")
+        self.assertEqual(samples[1]["elapsed_ms"], 0.00015)
+        self.assertIsNone(samples[1]["frame_id"])
+
+    def test_interleaved_dashboard_renders_do_not_claim_frame_correlation(self) -> None:
+        telemetry = app.StreamTelemetry()
+        snapshots = iter(
+            (
+                ({"frame_id": 101}, b"first"),
+                ({"frame_id": 202}, b"second"),
+            )
+        )
+        clock_values = iter((0, 10, 20, 30, 40, 50, 60, 70))
+
+        with (
+            patch.object(app, "STREAM_TELEMETRY", telemetry),
+            patch.object(app, "read_snapshot", side_effect=lambda mode: next(snapshots)),
+            patch.object(app.time, "perf_counter_ns", side_effect=lambda: next(clock_values)),
+        ):
+            first_session_snapshot = app.read_dashboard_snapshot("coco", "coco")
+            second_session_snapshot = app.read_dashboard_snapshot("coco", "coco")
+            app.measure_dashboard_render("coco")(lambda: first_session_snapshot)()
+            app.measure_dashboard_render("coco")(lambda: second_session_snapshot)()
+
+        samples = telemetry.export()["dashboard_samples"]
+        self.assertEqual(
+            [sample["frame_id"] for sample in samples if sample["stage"] == "snapshot_read"],
+            [101, 202],
+        )
+        self.assertEqual(
+            [sample["frame_id"] for sample in samples if sample["stage"] == "render_call"],
+            [None, None],
+        )
 
 
 if __name__ == "__main__":

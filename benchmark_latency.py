@@ -17,6 +17,40 @@ TIMING_FIELDS = (
     "navigation_evaluation_latency_ms",
     "frame_processing_latency_ms",
 )
+REAL_STREAM_TIMING_FIELDS = (
+    "callback_to_snapshot_publication_ms",
+    "snapshot_publication_ms",
+)
+REAL_STREAM_MEASUREMENT_DEFINITIONS = {
+    "inference_latency_ms": (
+        "model.track() call duration, excluding model-lock wait"
+    ),
+    "navigation_evaluation_latency_ms": (
+        "NavigationEngine.evaluate() duration; null outside navigation modes"
+    ),
+    "frame_processing_latency_ms": (
+        "accepted processing start through operator-assistance generation; "
+        "excludes snapshot publication"
+    ),
+    "callback_to_snapshot_publication_ms": (
+        "recv callback entry through successful atomic snapshot replacement"
+    ),
+    "snapshot_publication_ms": (
+        "snapshot publication function entry through successful atomic "
+        "replacement, including JPEG encoding"
+    ),
+    "dashboard_snapshot_read_ms": (
+        "server-side read_snapshot file read and metadata parsing duration"
+    ),
+    "dashboard_render_call_ms": (
+        "server-side Streamlit fragment Python call duration; excludes browser paint"
+    ),
+}
+DASHBOARD_TIMING_FIELDS = (
+    "dashboard_snapshot_read_ms",
+    "dashboard_render_call_ms",
+)
+REPEATABILITY_TIMING_FIELDS = TIMING_FIELDS + REAL_STREAM_TIMING_FIELDS
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 THRESHOLD_OPTIONS = {
     "inference_latency_ms": "--max-inference-latency-ms",
@@ -62,10 +96,11 @@ def _nearest_rank(values: list[float], percentile: float) -> float | None:
 
 def summarize_timings(
     samples: Iterable[dict[str, Any]],
+    fields: tuple[str, ...] = TIMING_FIELDS,
 ) -> dict[str, dict[str, int | float | None]]:
     rows = list(samples)
     summary: dict[str, dict[str, int | float | None]] = {}
-    for field in TIMING_FIELDS:
+    for field in fields:
         available: list[float] = []
         unavailable = 0
         for row in rows:
@@ -112,7 +147,7 @@ def _validated_report(report: Any, report_index: int) -> dict[str, Any]:
             f"Benchmark report {report_index} has an invalid measured_frames value."
         )
 
-    for metric in TIMING_FIELDS:
+    for metric in REPEATABILITY_TIMING_FIELDS:
         summary = report["latency"].get(metric)
         if summary is None:
             continue
@@ -156,6 +191,547 @@ def _validated_report(report: Any, report_index: int) -> dict[str, Any]:
                 f"Benchmark report {report_index} has percentiles without samples "
                 f"for {metric}."
             )
+    dashboard_latency = report.get("dashboard_latency", {})
+    if not isinstance(dashboard_latency, dict):
+        raise ValueError(
+            f"Benchmark report {report_index} has an invalid dashboard_latency object."
+        )
+    for metric in DASHBOARD_TIMING_FIELDS:
+        summary = dashboard_latency.get(metric)
+        if summary is None:
+            continue
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f"Benchmark report {report_index} has an invalid {metric} summary."
+            )
+        sample_count = summary.get("sample_count")
+        unavailable = summary.get("unavailable_samples")
+        total = summary.get("total_samples")
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in (sample_count, unavailable, total)
+        ) or sample_count + unavailable != total:
+            raise ValueError(
+                f"Benchmark report {report_index} has inconsistent sample counts "
+                f"for {metric}."
+            )
+        for percentile in ("p50_ms", "p95_ms"):
+            value = summary.get(percentile)
+            if value is None:
+                if sample_count:
+                    raise ValueError(
+                        f"Benchmark report {report_index} has samples but no "
+                        f"{percentile} for {metric}."
+                    )
+            elif (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"Benchmark report {report_index} has an invalid {percentile} "
+                    f"for {metric}."
+                )
+
+    stream_telemetry = report.get("stream_telemetry")
+    if (
+        report["input"].get("kind") == "real_webrtc_phone_stream"
+        and stream_telemetry is None
+    ):
+        raise ValueError(
+            f"Benchmark report {report_index} is missing stream telemetry "
+            "required for a real WebRTC report."
+        )
+    if stream_telemetry is not None:
+        if not isinstance(stream_telemetry, dict):
+            raise ValueError(
+                f"Benchmark report {report_index} has invalid stream telemetry."
+            )
+        counters = stream_telemetry.get("counters")
+        if not isinstance(counters, dict):
+            raise ValueError(
+                f"Benchmark report {report_index} is missing stream counters."
+            )
+        for name, count in counters.items():
+            if (
+                not isinstance(name, str)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+            ):
+                raise ValueError(
+                    f"Benchmark report {report_index} has an invalid stream counter."
+                )
+        required_counters = set(STREAM_COUNTERS)
+        if not required_counters.issubset(counters):
+            raise ValueError(
+                f"Benchmark report {report_index} is missing stream counters."
+            )
+        counter_definitions = stream_telemetry.get("counter_definitions")
+        if (
+            not isinstance(counter_definitions, dict)
+            or set(counter_definitions) != required_counters
+            or not all(
+                isinstance(value, str) and value
+                for value in counter_definitions.values()
+            )
+            or counter_definitions.get("frames_received")
+            != "legacy count of valid frames counted after stream ownership check"
+            or counter_definitions.get("frames_skipped")
+            != "legacy count of empty or invalid frames only"
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has invalid counter definitions."
+            )
+        retention = stream_telemetry.get("sample_retention")
+        if (
+            not isinstance(retention, dict)
+            or retention.get("frame_sample_capacity") != 1200
+            or retention.get("dashboard_sample_capacity") != 600
+            or not isinstance(retention.get("frame_samples_truncated"), bool)
+            or not isinstance(retention.get("dashboard_samples_truncated"), bool)
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has invalid sample-retention metadata."
+            )
+        if (
+            counters["valid_decoded_frames"] > counters["callback_frames_received"]
+            or counters["valid_decoded_frames"]
+            + counters["invalid_frames"]
+            + counters["decode_failures"]
+            > counters["callback_frames_received"]
+            or counters["frames_received"] > counters["valid_decoded_frames"]
+            or counters["accepted_for_processing"] > counters["frames_received"]
+            or counters["inference_throttled_frames"]
+            + counters["retry_suppressed_frames"]
+            + counters["accepted_for_processing"]
+            > counters["frames_received"]
+            or counters["successfully_processed_frames"]
+            + counters["processing_failures"]
+            > counters["accepted_for_processing"]
+            or counters["snapshot_publications_completed"]
+            != counters["successfully_processed_frames"]
+            or counters["invalid_frames"] + counters["decode_failures"]
+            > counters["callback_frames_received"]
+            or counters["snapshot_publication_failures"]
+            > counters["processing_failures"]
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has inconsistent stream counters."
+            )
+        if counters["frames_skipped"] != counters["invalid_frames"]:
+            raise ValueError(
+                f"Benchmark report {report_index} changes the legacy "
+                "frames_skipped counter meaning."
+            )
+        dashboard_sample_count = 0
+        for metric in DASHBOARD_TIMING_FIELDS:
+            summary = dashboard_latency.get(metric)
+            if summary is None:
+                raise ValueError(
+                    f"Benchmark report {report_index} is missing {metric} "
+                    "for stream telemetry."
+                )
+            dashboard_sample_count += summary["total_samples"]
+        dashboard_event_count = (
+            counters["dashboard_render_calls"]
+            + counters["dashboard_snapshot_reads"]
+        )
+        if dashboard_sample_count > dashboard_event_count:
+            raise ValueError(
+                f"Benchmark report {report_index} has more dashboard samples "
+                "than recorded dashboard events."
+            )
+        expected_frame_truncated = (
+            counters["successfully_processed_frames"]
+            > method["measured_frames"]
+        )
+        expected_dashboard_truncated = (
+            dashboard_event_count > dashboard_sample_count
+        )
+        if (
+            retention["frame_samples_truncated"] != expected_frame_truncated
+            or retention["dashboard_samples_truncated"]
+            != expected_dashboard_truncated
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has sample-retention flags "
+                "that disagree with its counters and retained samples."
+            )
+        elapsed = stream_telemetry.get("rate_denominator_seconds")
+        elapsed_seconds = stream_telemetry.get("elapsed_seconds")
+        rates = stream_telemetry.get("rates")
+        if not isinstance(rates, dict) or set(rates) != {
+            "receive_rate_hz",
+            "successful_processing_rate_hz",
+        }:
+            raise ValueError(
+                f"Benchmark report {report_index} has invalid stream rates."
+            )
+        if elapsed_seconds != elapsed:
+            raise ValueError(
+                f"Benchmark report {report_index} has inconsistent elapsed-time "
+                "denominators."
+            )
+        if elapsed is None:
+            if any(value is not None for value in rates.values()):
+                raise ValueError(
+                    f"Benchmark report {report_index} has rates without a denominator."
+                )
+        elif (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed)
+            or elapsed <= 0
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has an invalid rate denominator."
+            )
+        else:
+            rate_counters = {
+                "receive_rate_hz": "callback_frames_received",
+                "successful_processing_rate_hz": "successfully_processed_frames",
+            }
+            for rate_name, counter_name in rate_counters.items():
+                expected = counters.get(counter_name)
+                actual = rates.get(rate_name)
+                if expected is None or actual is None:
+                    if actual is not None:
+                        raise ValueError(
+                            f"Benchmark report {report_index} has a rate without "
+                            "its counter."
+                        )
+                elif (
+                    isinstance(actual, bool)
+                    or not isinstance(actual, (int, float))
+                    or not math.isfinite(actual)
+                    or actual < 0
+                    or not math.isclose(
+                        actual,
+                        expected / elapsed,
+                        rel_tol=1e-9,
+                    )
+                ):
+                    raise ValueError(
+                        f"Benchmark report {report_index} has an invalid "
+                        f"{rate_name}."
+                    )
+    if report["input"].get("kind") == "real_webrtc_phone_stream":
+        definitions = method.get("measurement_definitions")
+        warmup = method.get("warmup_frames")
+        if (
+            method.get("measurement_definition")
+            != "objectvision_real_stream_telemetry_v1"
+            or method.get("sample_method")
+            != "bounded successful snapshot records"
+            or definitions != REAL_STREAM_MEASUREMENT_DEFINITIONS
+            or isinstance(warmup, bool)
+            or not isinstance(warmup, int)
+            or warmup < 1
+            or method.get("warmup_excluded_from_statistics") is not True
+            or report["input"].get("capture_configuration")
+            != {
+                "facing_mode": "ideal environment",
+                "audio": False,
+                "signalling": "HTTPS",
+            }
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has invalid real-stream "
+                "measurement definitions."
+            )
+    return report
+
+
+def load_real_stream_telemetry(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as source:
+            payload = json.load(source, parse_constant=_reject_json_constant)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Could not read real-stream telemetry {path}: {exc}") from exc
+    return build_real_stream_report(payload)
+
+
+STREAM_COUNTERS = (
+    "callback_frames_received",
+    "valid_decoded_frames",
+    "frames_received",
+    "frames_skipped",
+    "invalid_frames",
+    "decode_failures",
+    "accepted_for_processing",
+    "inference_throttled_frames",
+    "retry_suppressed_frames",
+    "processing_failures",
+    "successfully_processed_frames",
+    "snapshot_publications_completed",
+    "snapshot_publication_failures",
+    "dashboard_render_calls",
+    "dashboard_snapshot_reads",
+)
+
+
+def build_real_stream_report(telemetry: Any) -> dict[str, Any]:
+    if not isinstance(telemetry, dict):
+        raise ValueError("Real-stream telemetry must be a JSON object.")
+    if telemetry.get("schema_version") != 1:
+        raise ValueError("Unsupported real-stream telemetry schema version.")
+    if telemetry.get("source_type") != "real_webrtc_phone_stream":
+        raise ValueError("Telemetry source_type is not a real WebRTC phone stream.")
+    if telemetry.get("transport") != "WebRTC":
+        raise ValueError("Real-stream telemetry must identify WebRTC transport.")
+    environment = telemetry.get("environment")
+    counters = telemetry.get("counters")
+    samples = telemetry.get("samples")
+    dashboard_samples = telemetry.get("dashboard_samples")
+    if not isinstance(environment, dict) or not isinstance(counters, dict):
+        raise ValueError("Telemetry is missing environment or counter metadata.")
+    if not all(
+        isinstance(environment.get(name), str) and environment.get(name)
+        for name in ("os", "python", "architecture")
+    ):
+        raise ValueError("Telemetry has incomplete environment metadata.")
+    cpu_count = environment.get("logical_cpu_count")
+    if (
+        isinstance(cpu_count, bool)
+        or not isinstance(cpu_count, int)
+        or cpu_count < 1
+        or not isinstance(environment.get("ultralytics"), str)
+        or not environment.get("ultralytics")
+    ):
+        raise ValueError("Telemetry has incomplete laptop environment metadata.")
+    capture_configuration = telemetry.get("capture_configuration")
+    if capture_configuration != {
+        "facing_mode": "ideal environment",
+        "audio": False,
+        "signalling": "HTTPS",
+    }:
+        raise ValueError("Telemetry has incompatible phone capture configuration.")
+    missing_counters = set(STREAM_COUNTERS) - set(counters)
+    if missing_counters:
+        raise ValueError(
+            "Telemetry is missing counters: " + ", ".join(sorted(missing_counters))
+        )
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("Telemetry contains no successful snapshot samples.")
+    if len(samples) > 1200:
+        raise ValueError("Telemetry exceeds the bounded frame-sample capacity.")
+    if not isinstance(dashboard_samples, list) or len(dashboard_samples) > 600:
+        raise ValueError("Telemetry has invalid or excessive dashboard samples.")
+    successful_frames = counters.get("successfully_processed_frames")
+    if (
+        isinstance(successful_frames, bool)
+        or not isinstance(successful_frames, int)
+        or successful_frames < len(samples)
+    ):
+        raise ValueError("Telemetry sample count exceeds successful-frame counter.")
+    elapsed = telemetry.get("elapsed_seconds")
+    denominator = telemetry.get("rate_denominator_seconds")
+    if elapsed != denominator:
+        raise ValueError("Telemetry elapsed time and rate denominator do not match.")
+    if elapsed is not None and (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(elapsed)
+        or elapsed <= 0
+    ):
+        raise ValueError("Telemetry has an invalid monotonic elapsed-time denominator.")
+    warmup_excluded = telemetry.get("warmup_excluded")
+    warmup_frames_excluded = telemetry.get("warmup_frames_excluded")
+    if not isinstance(warmup_excluded, bool):
+        raise ValueError("Telemetry must state whether warm-up was excluded.")
+    if (
+        not warmup_excluded
+        or isinstance(warmup_frames_excluded, bool)
+        or not isinstance(warmup_frames_excluded, int)
+        or warmup_frames_excluded < 1
+    ):
+        raise ValueError(
+            "Warm-up has not been excluded. Reset telemetry after stream warm-up "
+            "before exporting a measured run."
+        )
+    measurement_definitions = telemetry.get("measurement_definitions")
+    counter_definitions = telemetry.get("counter_definitions")
+    if (
+        measurement_definitions != REAL_STREAM_MEASUREMENT_DEFINITIONS
+        or not isinstance(counter_definitions, dict)
+        or set(counter_definitions) != set(STREAM_COUNTERS)
+        or not all(
+            isinstance(value, str) and value
+            for value in counter_definitions.values()
+        )
+        or counter_definitions.get("frames_received")
+        != "legacy count of valid frames counted after stream ownership check"
+        or counter_definitions.get("frames_skipped")
+        != "legacy count of empty or invalid frames only"
+    ):
+        raise ValueError("Telemetry is missing or changes measurement definitions.")
+
+    config: dict[str, Any] | None = None
+    for index, sample in enumerate(samples, start=1):
+        if not isinstance(sample, dict):
+            raise ValueError(f"Telemetry frame sample {index} must be an object.")
+        sample_config = {
+            key: sample.get(key)
+            for key in (
+                "mode",
+                "resolution",
+                "confidence",
+                "model_name",
+                "model_sha256",
+                "device",
+                "tracker",
+                "persist",
+                "imgsz",
+            )
+        }
+        if (
+            sample_config["mode"] not in {"custom", "coco", "navigation"}
+            or not isinstance(sample_config["resolution"], dict)
+            or isinstance(sample_config["confidence"], bool)
+            or not isinstance(sample_config["confidence"], (int, float))
+            or not math.isfinite(sample_config["confidence"])
+            or not isinstance(sample_config["model_name"], str)
+            or not sample_config["model_name"]
+            or not isinstance(sample_config["device"], str)
+            or not isinstance(sample_config["tracker"], str)
+            or not isinstance(sample_config["persist"], bool)
+            or not isinstance(sample_config["imgsz"], str)
+        ):
+            raise ValueError(
+                f"Telemetry frame sample {index} has invalid inference settings."
+            )
+        if config is None:
+            config = sample_config
+        elif sample_config != config:
+            raise ValueError(
+                "Telemetry contains mixed frame configurations; export one mode/"
+                "model/settings per measurement."
+            )
+
+    if config is None:
+        raise ValueError("Telemetry contains no inference configuration.")
+    model_digest = config["model_sha256"]
+    if model_digest is not None and (
+        not isinstance(model_digest, str)
+        or len(model_digest) != 64
+        or any(character not in "0123456789abcdef" for character in model_digest.lower())
+    ):
+        raise ValueError("Telemetry contains an invalid model SHA-256 digest.")
+    resolution = config["resolution"]
+    width, height = resolution.get("width"), resolution.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width < 1
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height < 1
+    ):
+        raise ValueError("Telemetry has invalid frame resolution metadata.")
+
+    for index, sample in enumerate(samples, start=1):
+        frame_id = sample.get("frame_id")
+        if isinstance(frame_id, bool) or not isinstance(frame_id, int) or frame_id < 0:
+            raise ValueError(f"Telemetry frame sample {index} has an invalid frame ID.")
+    latency = summarize_timings(samples, REPEATABILITY_TIMING_FIELDS)
+    dashboard_values: dict[str, list[dict[str, Any]]] = {
+        "dashboard_snapshot_read_ms": [],
+        "dashboard_render_call_ms": [],
+    }
+    for index, sample in enumerate(dashboard_samples, start=1):
+        if not isinstance(sample, dict) or sample.get("stage") not in {
+            "snapshot_read",
+            "render_call",
+        }:
+            raise ValueError(f"Dashboard telemetry sample {index} is invalid.")
+        frame_id = sample.get("frame_id")
+        if (
+            not isinstance(sample.get("view"), str)
+            or not sample["view"]
+            or (
+                frame_id is not None
+                and (
+                    isinstance(frame_id, bool)
+                    or not isinstance(frame_id, int)
+                    or frame_id < 0
+                )
+            )
+        ):
+            raise ValueError(
+                f"Dashboard telemetry sample {index} has invalid correlation metadata."
+            )
+        elapsed = sample.get("elapsed_ms")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+        ):
+            raise ValueError(
+                f"Dashboard telemetry sample {index} has an invalid duration."
+            )
+        metric = (
+            "dashboard_snapshot_read_ms"
+            if sample["stage"] == "snapshot_read"
+            else "dashboard_render_call_ms"
+        )
+        dashboard_values[metric].append({metric: elapsed})
+    dashboard_latency = {}
+    for metric, values in dashboard_values.items():
+        durations = [float(sample[metric]) for sample in values]
+        dashboard_latency[metric] = {
+            "total_samples": len(durations),
+            "sample_count": len(durations),
+            "unavailable_samples": 0,
+            "p50_ms": _nearest_rank(durations, 0.50),
+            "p95_ms": _nearest_rank(durations, 0.95),
+        }
+    dashboard_coverage = sorted(
+        {
+            sample["view"]
+            for sample in dashboard_samples
+            if isinstance(sample, dict) and isinstance(sample.get("view"), str)
+        }
+    )
+    stream_metadata = {
+        "counters": counters,
+        "elapsed_seconds": telemetry.get("elapsed_seconds"),
+        "rate_denominator_seconds": telemetry.get("rate_denominator_seconds"),
+        "rates": telemetry.get("rates"),
+        "sample_retention": telemetry.get("sample_retention"),
+        "warmup_excluded": warmup_excluded,
+        "counter_definitions": counter_definitions,
+    }
+    report = {
+        "benchmark": "ObjectVision real WebRTC stream performance telemetry",
+        "generated_at_utc": telemetry.get("generated_at_utc"),
+        "method": {
+            "warmup_frames": warmup_frames_excluded,
+            "measured_frames": len(samples),
+            "warmup_excluded_from_statistics": warmup_excluded,
+            "percentile_method": "nearest rank",
+            "measurement_definition": "objectvision_real_stream_telemetry_v1",
+            "sample_method": "bounded successful snapshot records",
+            "measurement_definitions": measurement_definitions,
+            "counter_definitions": counter_definitions,
+            "dashboard_views_measured": dashboard_coverage,
+        },
+        "environment": environment,
+        "input": {
+            "kind": "real_webrtc_phone_stream",
+            "transport": "WebRTC",
+            "live": True,
+            "resolution": {"width": width, "height": height},
+            "capture_configuration": capture_configuration,
+        },
+        "inference": config,
+        "latency": latency,
+        "dashboard_latency": dashboard_latency,
+        "stream_telemetry": stream_metadata,
+    }
+    _validated_report(report, 1)
     return report
 
 
@@ -168,7 +744,23 @@ def analyze_repeatability(reports: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     reference = validated[0]
     configuration_sections = ("environment", "input", "inference", "method")
+    if (
+        reference["input"].get("kind") == "real_webrtc_phone_stream"
+        and not reference["inference"].get("model_sha256")
+    ):
+        raise ValueError(
+            "Real-stream reports without a model SHA-256 digest cannot be "
+            "compared for repeatability."
+        )
     for index, report in enumerate(validated[1:], start=2):
+        if (
+            report["input"].get("kind") == "real_webrtc_phone_stream"
+            and not report["inference"].get("model_sha256")
+        ):
+            raise ValueError(
+                f"Benchmark report {index} has no model SHA-256 digest; "
+                "repeatability cannot be verified."
+            )
         differences = [
             section
             for section in configuration_sections
@@ -182,7 +774,7 @@ def analyze_repeatability(reports: list[dict[str, Any]]) -> dict[str, Any]:
 
     metrics: dict[str, Any] = {}
     measured_frames = reference["method"]["measured_frames"]
-    for metric in TIMING_FIELDS:
+    for metric in REPEATABILITY_TIMING_FIELDS:
         run_summaries = []
         p50_values: list[float] = []
         p95_values: list[float] = []
@@ -231,6 +823,96 @@ def analyze_repeatability(reports: list[dict[str, Any]]) -> dict[str, Any]:
             },
         }
 
+    dashboard_metrics: dict[str, Any] = {}
+    for metric in DASHBOARD_TIMING_FIELDS:
+        run_summaries = []
+        p50_values = []
+        p95_values = []
+        for index, report in enumerate(validated, start=1):
+            summary = report.get("dashboard_latency", {}).get(metric)
+            if summary is None:
+                sample_count = None
+                unavailable_samples = None
+                p50 = None
+                p95 = None
+            else:
+                sample_count = summary["sample_count"]
+                unavailable_samples = summary["unavailable_samples"]
+                p50 = summary["p50_ms"]
+                p95 = summary["p95_ms"]
+            if p50 is not None:
+                p50_values.append(float(p50))
+            if p95 is not None:
+                p95_values.append(float(p95))
+            run_summaries.append(
+                {
+                    "run": index,
+                    "sample_count": sample_count,
+                    "unavailable_samples": unavailable_samples,
+                    "p50_ms": p50,
+                    "p95_ms": p95,
+                }
+            )
+        dashboard_metrics[metric] = {
+            "runs": run_summaries,
+            "across_run_variability": {
+                "measure": "range of per-run percentiles",
+                "p50_range_ms": (
+                    max(p50_values) - min(p50_values)
+                    if len(p50_values) > 1
+                    else None
+                ),
+                "p95_range_ms": (
+                    max(p95_values) - min(p95_values)
+                    if len(p95_values) > 1
+                    else None
+                ),
+                "available_runs": len(p95_values),
+                "unavailable_runs": len(validated) - len(p95_values),
+            },
+        }
+
+    throughput: dict[str, Any] = {}
+    rate_names = ("receive_rate_hz", "successful_processing_rate_hz")
+    for rate_name in rate_names:
+        runs = []
+        available_values = []
+        counter_name = (
+            "callback_frames_received"
+            if rate_name == "receive_rate_hz"
+            else "successfully_processed_frames"
+        )
+        for index, report in enumerate(validated, start=1):
+            stream = report.get("stream_telemetry")
+            if stream is None:
+                count = None
+                denominator = None
+                rate = None
+            else:
+                count = stream["counters"][counter_name]
+                denominator = stream["rate_denominator_seconds"]
+                rate = stream["rates"].get(rate_name)
+            if rate is not None:
+                available_values.append(float(rate))
+            runs.append(
+                {
+                    "run": index,
+                    "count": count,
+                    "denominator_seconds": denominator,
+                    "rate_hz": rate,
+                }
+            )
+        throughput[rate_name] = {
+            "runs": runs,
+            "across_run_range_hz": (
+                max(available_values) - min(available_values)
+                if len(available_values) > 1
+                else None
+            ),
+            "available_runs": len(available_values),
+            "unavailable_runs": len(validated) - len(available_values),
+        }
+
     return {
         "analysis": "ObjectVision benchmark repeatability",
         "configuration": {
@@ -239,9 +921,12 @@ def analyze_repeatability(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "run_count": len(validated),
         "variability_definition": (
             "Range (maximum minus minimum) of each percentile across benchmark "
-            "runs; this is not frame-to-frame variability."
+            "runs; this is not frame-to-frame variability. Dashboard values "
+            "measure server-side calls, not browser paint."
         ),
         "metrics": metrics,
+        "dashboard_metrics": dashboard_metrics,
+        "throughput": throughput,
     }
 
 
@@ -493,6 +1178,14 @@ def _arguments() -> argparse.Namespace:
         metavar="REPORT.json",
         help="Analyze repeatability across two or more existing benchmark reports.",
     )
+    parser.add_argument(
+        "--telemetry",
+        type=Path,
+        help=(
+            "Validate and summarize JSON telemetry exported by the Android "
+            "phone's real WebRTC session."
+        ),
+    )
     for metric, option in THRESHOLD_OPTIONS.items():
         parser.add_argument(
             option,
@@ -690,6 +1383,20 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     args = _arguments()
+    if args.telemetry is not None:
+        if args.input is not None or args.compare:
+            raise SystemExit("--telemetry cannot be combined with --input or --compare.")
+        try:
+            report = load_real_stream_telemetry(args.telemetry)
+            report = add_threshold_validation(report, args.latency_thresholds)
+        except ValueError as exc:
+            raise SystemExit(f"real-stream telemetry rejected: {exc}") from exc
+        if args.output is None:
+            print(json.dumps(report, indent=2, allow_nan=False))
+            return
+        write_report(args.output, report)
+        print(f"Real-stream telemetry report written to {args.output}")
+        return
     if args.compare:
         if args.input is not None or args.latency_thresholds:
             raise SystemExit(

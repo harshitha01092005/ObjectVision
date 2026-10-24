@@ -700,6 +700,8 @@ class ObjectVideoProcessor(VideoProcessorBase):
             last_frame_received_at=frame_received_at,
             inference_status="running",
         )
+        # Covers accepted inference through assistance; skipped and failed frames publish no metrics.
+        processing_started_ns = time.perf_counter_ns()
         try:
             if mode in {"coco", "navigation"}:
                 config = read_navigation_config()
@@ -711,8 +713,8 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 reset_model_tracking(model, mode)
                 self.tracking_model = model
                 self.detection_stabilizer.reset()
-            inference_started_at = time.time()
             with MODEL_LOCKS["custom" if mode == "custom" else "coco"]:
+                inference_started_ns = time.perf_counter_ns()
                 result = model.track(
                     source=image,
                     conf=confidence,
@@ -721,7 +723,9 @@ class ObjectVideoProcessor(VideoProcessorBase):
                     persist=True,
                     tracker=self.detection_stability_config.tracker_config,
                 )[0]
-            inference_latency_ms = (time.time() - inference_started_at) * 1000.0
+                inference_latency_ms = (
+                    time.perf_counter_ns() - inference_started_ns
+                ) / 1_000_000
             names = mode_class_names(model)
             boxes = result.boxes
             class_counts: dict[str, int] = {}
@@ -779,12 +783,14 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 motion=motion,
             )
             navigation_result = None
+            navigation_evaluation_latency_ms = None
             if mode in {"coco", "navigation"}:
                 height, width = image.shape[:2]
                 navigation_now = time.time()
                 frame_age = max(0.0, navigation_now - frame_received_at)
                 fresh_frame = frame_age <= self.navigation_config.max_frame_age_seconds
                 guidance_input = detection_inputs if fresh_frame else []
+                navigation_started_ns = time.perf_counter_ns()
                 navigation_result = self.navigation_engine.evaluate(
                     guidance_input,
                     width,
@@ -793,6 +799,9 @@ class ObjectVideoProcessor(VideoProcessorBase):
                     now=navigation_now,
                     visual_memory_tracks=memory_snapshot.get("tracks", []),
                 )
+                navigation_evaluation_latency_ms = (
+                    time.perf_counter_ns() - navigation_started_ns
+                ) / 1_000_000
                 navigation_result = gate_navigation_evidence(
                     navigation_result,
                     image_quality_status=quality.status,
@@ -835,6 +844,9 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 image_height=image.shape[0],
             )
 
+            frame_processing_latency_ms = (
+                time.perf_counter_ns() - processing_started_ns
+            ) / 1_000_000
             frame_age_seconds = max(0.0, now - frame_received_at)
             fps = (
                 self.frames_processed[mode] / max(now - self.stream_started_at, 1.0)
@@ -870,6 +882,14 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 "confidence_smoothing_alpha": self.detection_stability_config.confidence_alpha,
                 "tracker": self.detection_stability_config.tracker_config,
                 "inference_latency_ms": round(inference_latency_ms, 2),
+                "navigation_evaluation_latency_ms": (
+                    round(navigation_evaluation_latency_ms, 2)
+                    if navigation_evaluation_latency_ms is not None
+                    else None
+                ),
+                "frame_processing_latency_ms": round(
+                    frame_processing_latency_ms, 2
+                ),
                 "fps": round(fps, 2),
                 "inference_status": (
                     "detections found" if detection_count else "no detections"
@@ -900,6 +920,9 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 last_inference_at=now,
                 frame_age_seconds=frame_age_seconds,
                 inference_latency_ms=metrics["inference_latency_ms"],
+                frame_processing_latency_ms=metrics[
+                    "frame_processing_latency_ms"
+                ],
                 fps=metrics["fps"],
             )
             return av.VideoFrame.from_ndarray(annotated, format="bgr24")

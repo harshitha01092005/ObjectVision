@@ -96,6 +96,47 @@ failure is shown in the camera status and on the relevant results screen.
 Both models currently run on the laptop CPU. The COCO model is a small model,
 but CPU speed depends on laptop hardware and input video resolution.
 
+## Reproducible latency benchmark
+
+Use `benchmark_latency.py` to measure the app's published inference,
+navigation-evaluation, and processed-frame latency fields without connecting a
+live camera. From the project directory:
+
+```bash
+.venv/bin/python benchmark_latency.py \
+  --mode navigation \
+  --resolution 640x480 \
+  --warmup 10 \
+  --samples 100
+```
+
+By default, the benchmark uses a deterministic generated frame and does not
+save image frames. To use a prerecorded image or video instead, pass
+`--input /path/to/image-or-video`; the report records its file name and SHA-256
+digest, but does not copy or store the source. Video frames are read in order
+and looped when the requested sample count exceeds its length. Input reading,
+decoding, and resizing occur outside the measured processing interval.
+
+The benchmark warms the model and pipeline for the requested number of frames,
+resets tracker/navigation/memory state, then collects the requested measured
+samples. It prints a JSON report with environment and inference settings, the
+sample count, unavailable-value count, and nearest-rank p50/p95 for each timing
+field. An unavailable navigation duration is counted as unavailable, never
+treated as zero. Use `--output report.json` to save a new report; it refuses to
+overwrite an existing file.
+
+`inference_latency_ms` measures the actual `model.track()` call, excluding
+model-lock wait. `navigation_evaluation_latency_ms` measures
+`NavigationEngine.evaluate()` and is unavailable in custom-model mode.
+`frame_processing_latency_ms` starts after frame decoding, quality/motion
+analysis, throttling, and model-retry checks, and ends after operator
+assistance generation. It excludes camera wait, skipped/throttled frames,
+snapshot serialization/publication, and input-file reading. These are
+processing-stage measurements, not full camera-to-dashboard latency. Compare
+reports only when hardware, model weights, mode, resolution, confidence,
+tracker, and source type are matched. The tool makes no performance claim by
+itself.
+
 ## Python and installation
 
 The system Python in this workspace reports Python 3.14.6. The existing

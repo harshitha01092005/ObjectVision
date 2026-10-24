@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -215,6 +216,54 @@ class StreamPipelineTests(unittest.TestCase):
         self.assertEqual(len(navigation["detections"]), 1)
         self.assertEqual(navigation["detections"][0]["name"], "person")
         self.assertEqual(navigation["frame_fresh"], True)
+
+    def test_processor_publishes_monotonic_stage_durations(self) -> None:
+        clock_values = iter(
+            (
+                1_000_000_000,
+                2_000_000_000,
+                2_125_000_000,
+                3_000_000_000,
+                3_010_000_000,
+                4_000_000_000,
+            )
+        )
+        with patch.object(
+            app.time,
+            "perf_counter_ns",
+            side_effect=lambda: next(clock_values),
+        ):
+            _, snapshots, _ = self.run_processor(
+                "navigation",
+                include_person=True,
+            )
+
+        metrics, _ = snapshots[0]
+        measured_durations = (
+            metrics["inference_latency_ms"],
+            metrics["navigation_evaluation_latency_ms"],
+            metrics["frame_processing_latency_ms"],
+        )
+        for duration in measured_durations:
+            with self.subTest(duration=duration):
+                self.assertIsInstance(duration, (int, float))
+                self.assertTrue(math.isfinite(duration))
+                self.assertGreaterEqual(duration, 0)
+        self.assertEqual(metrics["inference_latency_ms"], 125.0)
+        self.assertEqual(metrics["navigation_evaluation_latency_ms"], 10.0)
+        self.assertEqual(metrics["frame_processing_latency_ms"], 3000.0)
+
+    def test_non_navigation_mode_reports_navigation_duration_as_unavailable(self) -> None:
+        with patch.object(app.time, "perf_counter_ns", side_effect=range(6)):
+            _, snapshots, _ = self.run_processor(
+                "custom",
+                include_person=True,
+            )
+
+        metrics, _ = snapshots[0]
+        self.assertIsNone(metrics["navigation_evaluation_latency_ms"])
+        self.assertGreaterEqual(metrics["inference_latency_ms"], 0)
+        self.assertGreaterEqual(metrics["frame_processing_latency_ms"], 0)
 
     def test_navigation_uses_memory_updated_from_the_evaluated_frame(self) -> None:
         memory_snapshots: list[dict[str, object]] = []

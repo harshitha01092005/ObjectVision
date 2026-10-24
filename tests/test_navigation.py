@@ -207,6 +207,14 @@ class NavigationEngineTests(unittest.TestCase):
         )
         self.assertEqual(uncertain.recommendation, UNCERTAIN)
 
+    def test_memory_caution_cannot_create_a_direction_from_empty_detections(self) -> None:
+        tracks = [self.missing_track((10, 30, 70, 120), last_seen=self.now)]
+
+        result = self.evaluate([], visual_memory_tracks=tracks)
+
+        self.assertEqual(result.recommendation, MOVE_FORWARD)
+        self.assertNotIn(result.recommendation, {GO_LEFT, GO_RIGHT})
+
     def test_center_blocked_and_right_clear_suggests_right_after_confirmation(self) -> None:
         detections = [
             self.box("person", 0.9, 110, 30, 190, 150),
@@ -226,6 +234,52 @@ class NavigationEngineTests(unittest.TestCase):
         stale = self.evaluate([], frame_time=self.now - 10)
         self.assertEqual(stale.recommendation, UNCERTAIN)
         self.assertFalse(stale.frame_fresh)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+    def test_stale_interruption_restarts_pending_direction_confirmation(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        stale = self.evaluate([], frame_time=self.now - 10)
+        self.assertEqual(stale.recommendation, UNCERTAIN)
+        self.assertFalse(stale.frame_fresh)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+    def test_low_confidence_interruption_restarts_pending_direction_confirmation(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        insufficient = self.evaluate(
+            [self.box("person", 0.2, 110, 30, 190, 150)]
+        )
+        self.assertEqual(insufficient.recommendation, UNCERTAIN)
+        self.assertTrue(insufficient.frame_fresh)
+        self.assertFalse(insufficient.valid_evidence)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+    def test_fresh_empty_frame_interrupts_pending_direction_confirmation(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        empty = self.evaluate([])
+        self.assertEqual(empty.recommendation, MOVE_FORWARD)
+        self.assertTrue(empty.frame_fresh)
+        self.assertTrue(empty.valid_evidence)
 
         self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
         self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
@@ -347,6 +401,53 @@ class NavigationEngineTests(unittest.TestCase):
         self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
         self.assertEqual(self.evaluate(right_clear).recommendation, UNCERTAIN)
         self.assertEqual(self.evaluate(right_clear).recommendation, GO_RIGHT)
+
+    def test_rapid_direction_alternation_never_emits_unconfirmed_direction(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        right_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 5, 20, 75, 140),
+        ]
+        sequence = (
+            (left_clear, UNCERTAIN),
+            (right_clear, UNCERTAIN),
+            (left_clear, UNCERTAIN),
+            (right_clear, UNCERTAIN),
+            (left_clear, UNCERTAIN),
+            (left_clear, GO_LEFT),
+        )
+
+        for index, (detections, expected) in enumerate(sequence):
+            with self.subTest(index=index, expected=expected):
+                result = self.evaluate(detections)
+                self.assertEqual(result.recommendation, expected)
+                if expected == UNCERTAIN:
+                    self.assertNotIn(result.recommendation, {GO_LEFT, GO_RIGHT})
+
+    def test_memory_caution_downgrade_requires_fresh_direction_confirmation(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+        missing_left_track = [
+            self.missing_track((10, 30, 70, 120), last_seen=self.now)
+        ]
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
+
+        cautioned = self.evaluate(
+            left_clear,
+            visual_memory_tracks=missing_left_track,
+        )
+        self.assertEqual(cautioned.recommendation, UNCERTAIN)
+        self.assertIn("recently missing", cautioned.explanation)
+
+        self.assertEqual(self.evaluate(left_clear).recommendation, UNCERTAIN)
+        self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
 
     def test_recent_bounding_box_growth_increases_apparent_proximity(self) -> None:
         first = self.evaluate([self.box("person", 0.9, 120, 100, 180, 140)])

@@ -126,7 +126,7 @@ treated as zero. Use `--output report.json` to save a new report; it refuses to
 overwrite an existing file.
 
 `inference_latency_ms` measures the actual `model.track()` call, excluding
-model-lock wait. `navigation_evaluation_latency_ms` measures
+model-lock wait. `navigation_evaluation_latency_ms` measures only
 `NavigationEngine.evaluate()` and is unavailable in custom-model mode.
 `frame_processing_latency_ms` starts after frame decoding, quality/motion
 analysis, throttling, and model-retry checks, and ends after operator
@@ -136,6 +136,61 @@ processing-stage measurements, not full camera-to-dashboard latency. Compare
 reports only when hardware, model weights, mode, resolution, confidence,
 tracker, and source type are matched. The tool makes no performance claim by
 itself.
+
+### Optional p95 acceptance thresholds
+
+Thresholds are user-selected acceptance criteria, separate from measured
+latencies. Supply one or more positive, finite limits in milliseconds:
+
+```bash
+.venv/bin/python benchmark_latency.py \
+  --mode navigation \
+  --resolution 640x480 \
+  --warmup 10 \
+  --samples 100 \
+  --max-inference-latency-ms 35 \
+  --max-navigation-evaluation-latency-ms 5 \
+  --max-frame-processing-latency-ms 50
+```
+
+The optional `threshold_validation` JSON section reports each configured
+metric's threshold, measured p95, status (`pass`, `fail`, or `not_evaluable`),
+and reason. A metric passes when its measured p95 is at or below the supplied
+threshold. If no p95 measurement exists, its status is `not_evaluable`; it is
+never substituted with zero. Invalid, non-finite, or non-positive thresholds
+are rejected with a CLI error. When no threshold options are provided, the
+section is omitted and the existing report schema is unchanged.
+
+Thresholds validate only the selected processing-stage metric for this
+benchmark run. Passing one does not establish end-to-end camera-to-dashboard
+latency, real-time suitability, or real-world navigation safety. Synthetic
+input does not represent a real scene or camera stream.
+
+### Repeatability analysis
+
+To compare two or more saved benchmark reports, run:
+
+```bash
+.venv/bin/python benchmark_latency.py \
+  --compare run-1.json run-2.json run-3.json \
+  --output repeatability.json
+```
+
+Reports must match in environment, input source and resolution, inference/model
+settings, warm-up count, measured sample count, and measurement method. A
+mismatch is rejected with the differing report section; create new runs with
+matching settings before comparing. The analysis gives each run's p50 and p95
+for every latency metric and reports the across-run range (maximum minus
+minimum) of each percentile. Unavailable metrics, including navigation latency
+when it was not measured, remain `null` and are counted as unavailable rather
+than treated as zero.
+
+The range describes variation between separate benchmark runs, not
+frame-to-frame timing variation. Repeatable synthetic-input results do not
+establish real-camera performance or end-to-end phone-to-laptop latency, and
+repeatability alone does not mean the system is fast or safe. Use the same
+prerecorded source and matching environment/settings when reproducibility
+against real footage is required; the benchmark does not save input frames.
 
 ## Python and installation
 

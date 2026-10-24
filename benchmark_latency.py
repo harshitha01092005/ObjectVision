@@ -18,6 +18,11 @@ TIMING_FIELDS = (
     "frame_processing_latency_ms",
 )
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+THRESHOLD_OPTIONS = {
+    "inference_latency_ms": "--max-inference-latency-ms",
+    "navigation_evaluation_latency_ms": "--max-navigation-evaluation-latency-ms",
+    "frame_processing_latency_ms": "--max-frame-processing-latency-ms",
+}
 
 
 def parse_resolution(value: str) -> tuple[int, int]:
@@ -31,6 +36,20 @@ def parse_resolution(value: str) -> tuple[int, int]:
     if width < 1 or height < 1:
         raise argparse.ArgumentTypeError("Resolution dimensions must be positive.")
     return width, height
+
+
+def parse_positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "latency threshold must be a finite positive number of milliseconds."
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "latency threshold must be a finite positive number of milliseconds."
+        )
+    return parsed
 
 
 def _nearest_rank(values: list[float], percentile: float) -> float | None:
@@ -71,6 +90,244 @@ def summarize_timings(
             "p95_ms": _nearest_rank(available, 0.95),
         }
     return summary
+
+
+def _validated_report(report: Any, report_index: int) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        raise ValueError(f"Benchmark report {report_index} must be a JSON object.")
+    for section in ("environment", "input", "inference", "method", "latency"):
+        if not isinstance(report.get(section), dict):
+            raise ValueError(
+                f"Benchmark report {report_index} is missing its {section} object."
+            )
+
+    method = report["method"]
+    measured_frames = method.get("measured_frames")
+    if (
+        isinstance(measured_frames, bool)
+        or not isinstance(measured_frames, int)
+        or measured_frames < 1
+    ):
+        raise ValueError(
+            f"Benchmark report {report_index} has an invalid measured_frames value."
+        )
+
+    for metric in TIMING_FIELDS:
+        summary = report["latency"].get(metric)
+        if summary is None:
+            continue
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f"Benchmark report {report_index} has an invalid {metric} summary."
+            )
+        sample_count = summary.get("sample_count")
+        unavailable = summary.get("unavailable_samples")
+        total = summary.get("total_samples")
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in (sample_count, unavailable, total)
+        ) or total != measured_frames or sample_count + unavailable != total:
+            raise ValueError(
+                f"Benchmark report {report_index} has inconsistent sample counts "
+                f"for {metric}."
+            )
+        for percentile in ("p50_ms", "p95_ms"):
+            value = summary.get(percentile)
+            if value is None:
+                if sample_count:
+                    raise ValueError(
+                        f"Benchmark report {report_index} has samples but no "
+                        f"{percentile} for {metric}."
+                    )
+            elif (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"Benchmark report {report_index} has an invalid {percentile} "
+                    f"for {metric}."
+                )
+        if not sample_count and any(
+            summary.get(percentile) is not None for percentile in ("p50_ms", "p95_ms")
+        ):
+            raise ValueError(
+                f"Benchmark report {report_index} has percentiles without samples "
+                f"for {metric}."
+            )
+    return report
+
+
+def analyze_repeatability(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(reports) < 2:
+        raise ValueError("Repeatability analysis requires at least two reports.")
+    validated = [
+        _validated_report(report, index)
+        for index, report in enumerate(reports, start=1)
+    ]
+    reference = validated[0]
+    configuration_sections = ("environment", "input", "inference", "method")
+    for index, report in enumerate(validated[1:], start=2):
+        differences = [
+            section
+            for section in configuration_sections
+            if report[section] != reference[section]
+        ]
+        if differences:
+            raise ValueError(
+                f"Benchmark report {index} configuration differs in: "
+                f"{', '.join(differences)}."
+            )
+
+    metrics: dict[str, Any] = {}
+    measured_frames = reference["method"]["measured_frames"]
+    for metric in TIMING_FIELDS:
+        run_summaries = []
+        p50_values: list[float] = []
+        p95_values: list[float] = []
+        for index, report in enumerate(validated, start=1):
+            summary = report["latency"].get(metric)
+            if summary is None:
+                sample_count = 0
+                unavailable_samples = measured_frames
+                p50 = None
+                p95 = None
+            else:
+                sample_count = summary["sample_count"]
+                unavailable_samples = summary["unavailable_samples"]
+                p50 = summary["p50_ms"]
+                p95 = summary["p95_ms"]
+            if p50 is not None:
+                p50_values.append(float(p50))
+            if p95 is not None:
+                p95_values.append(float(p95))
+            run_summaries.append(
+                {
+                    "run": index,
+                    "sample_count": sample_count,
+                    "unavailable_samples": unavailable_samples,
+                    "p50_ms": p50,
+                    "p95_ms": p95,
+                }
+            )
+
+        metrics[metric] = {
+            "runs": run_summaries,
+            "across_run_variability": {
+                "measure": "range of per-run percentiles",
+                "p50_range_ms": (
+                    max(p50_values) - min(p50_values)
+                    if len(p50_values) > 1
+                    else None
+                ),
+                "p95_range_ms": (
+                    max(p95_values) - min(p95_values)
+                    if len(p95_values) > 1
+                    else None
+                ),
+                "available_runs": len(p95_values),
+                "unavailable_runs": len(validated) - len(p95_values),
+            },
+        }
+
+    return {
+        "analysis": "ObjectVision benchmark repeatability",
+        "configuration": {
+            section: reference[section] for section in configuration_sections
+        },
+        "run_count": len(validated),
+        "variability_definition": (
+            "Range (maximum minus minimum) of each percentile across benchmark "
+            "runs; this is not frame-to-frame variability."
+        ),
+        "metrics": metrics,
+    }
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON numeric constant: {value}")
+
+
+def load_benchmark_reports(paths: list[Path]) -> list[dict[str, Any]]:
+    reports = []
+    for index, path in enumerate(paths, start=1):
+        try:
+            with path.open(encoding="utf-8") as source:
+                reports.append(
+                    json.load(
+                        source,
+                        parse_constant=_reject_json_constant,
+                    )
+                )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"Could not read benchmark report {path}: {exc}") from exc
+        _validated_report(reports[-1], index)
+    return reports
+
+
+def validate_latency_thresholds(
+    latency: dict[str, dict[str, Any]],
+    thresholds: dict[str, float],
+) -> dict[str, dict[str, Any]]:
+    unknown_metrics = set(thresholds) - set(TIMING_FIELDS)
+    if unknown_metrics:
+        raise ValueError(
+            f"Unsupported latency threshold metric(s): {', '.join(sorted(unknown_metrics))}"
+        )
+
+    validation: dict[str, dict[str, Any]] = {}
+    for metric in TIMING_FIELDS:
+        if metric not in thresholds:
+            continue
+        threshold = thresholds[metric]
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold)
+            or threshold <= 0
+        ):
+            raise ValueError(
+                f"Threshold for {metric} must be a finite positive number of milliseconds."
+            )
+
+        measured_p95 = latency.get(metric, {}).get("p95_ms")
+        if measured_p95 is None:
+            status = "not_evaluable"
+            reason = "No measured p95 is available for this metric."
+        elif (
+            isinstance(measured_p95, bool)
+            or not isinstance(measured_p95, (int, float))
+            or not math.isfinite(measured_p95)
+            or measured_p95 < 0
+        ):
+            raise ValueError(f"Invalid measured p95 value for {metric}.")
+        elif measured_p95 <= threshold:
+            status = "pass"
+            reason = "Measured p95 is at or below the configured threshold."
+        else:
+            status = "fail"
+            reason = "Measured p95 exceeds the configured threshold."
+
+        validation[metric] = {
+            "threshold_ms": threshold,
+            "measured_p95_ms": measured_p95,
+            "status": status,
+            "reason": reason,
+        }
+    return validation
+
+
+def add_threshold_validation(
+    report: dict[str, Any],
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    if thresholds:
+        report["threshold_validation"] = validate_latency_thresholds(
+            report["latency"],
+            thresholds,
+        )
+    return report
 
 
 def deterministic_frame(width: int, height: int):
@@ -230,6 +487,20 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument(
+        "--compare",
+        nargs="+",
+        type=Path,
+        metavar="REPORT.json",
+        help="Analyze repeatability across two or more existing benchmark reports.",
+    )
+    for metric, option in THRESHOLD_OPTIONS.items():
+        parser.add_argument(
+            option,
+            dest=f"max_{metric.removesuffix('_latency_ms')}_latency_ms",
+            type=parse_positive_finite_float,
+            help=f"Optional maximum p95 for {metric} in milliseconds.",
+        )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optional JSON report path; existing files are not overwritten.",
@@ -241,6 +512,18 @@ def _arguments() -> argparse.Namespace:
         parser.error("--warmup must be zero or greater.")
     if args.samples < 1:
         parser.error("--samples must be positive.")
+    args.latency_thresholds = {
+        metric: getattr(
+            args,
+            f"max_{metric.removesuffix('_latency_ms')}_latency_ms",
+        )
+        for metric in TIMING_FIELDS
+        if getattr(
+            args,
+            f"max_{metric.removesuffix('_latency_ms')}_latency_ms",
+        )
+        is not None
+    }
     return args
 
 
@@ -357,7 +640,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     results = summarize_timings(samples)
     import ultralytics
 
-    return {
+    report = {
         "benchmark": "ObjectVision processed-frame latency",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "method": {
@@ -399,10 +682,29 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         },
         "latency": results,
     }
+    return add_threshold_validation(
+        report,
+        getattr(args, "latency_thresholds", {}),
+    )
 
 
 def main() -> None:
     args = _arguments()
+    if args.compare:
+        if args.input is not None or args.latency_thresholds:
+            raise SystemExit(
+                "--compare cannot be combined with --input or latency thresholds."
+            )
+        try:
+            report = analyze_repeatability(load_benchmark_reports(args.compare))
+        except ValueError as exc:
+            raise SystemExit(f"benchmark comparison failed: {exc}") from exc
+        if args.output is None:
+            print(json.dumps(report, indent=2, allow_nan=False))
+            return
+        write_report(args.output, report)
+        print(f"Repeatability report written to {args.output}")
+        return
     report = run_benchmark(args)
     if args.output is None:
         print(json.dumps(report, indent=2, allow_nan=False))

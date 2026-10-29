@@ -107,8 +107,7 @@ distance, real-world clearance, or safety; recommendations remain advisory.
 are Battery, Dice, ToyCar, Ants, Bees, Beetles, Caterpillars, Earthworms,
 Earwigs, Grasshoppers, Moths, Slugs, Snails, Wasps, and Weevils. It is not
 modified by this application. These are the labels exposed by the checked-in
-weights; they do not include a `crack` class, so this repository's model
-metadata does not substantiate a crack-specific detector.
+weights.
 
 ### COCO model
 
@@ -390,7 +389,7 @@ python -m pip install -r requirements.txt
 For future terminal sessions:
 
 ```bash
-cd "/path/to/crack_detector 2"
+cd "/path/to/ObjectVision"
 source .venv/bin/activate
 ```
 
@@ -403,7 +402,7 @@ existing `requirements.txt` lists `av`, `opencv-python-headless`, `streamlit`,
 From the project directory, activate the existing environment and launch HTTPS:
 
 ```bash
-cd "/path/to/crack_detector 2"
+cd "/path/to/ObjectVision"
 source .venv/bin/activate
 bash run_https.sh
 ```
@@ -424,7 +423,7 @@ Its generated certificate and key are local runtime files under
 Run the project unit tests with:
 
 ```bash
-cd "/path/to/crack_detector 2"
+cd "/path/to/ObjectVision"
 source .venv/bin/activate
 python -m unittest discover -s tests -q
 ```

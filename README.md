@@ -68,13 +68,36 @@ identity persistence. No additional NMS is applied; Ultralytics' normal
 detection postprocessing/NMS remains responsible for overlapping candidates.
 Navigation continues to use current tracker detections and raw confidence,
 not the smoothed display values. A strong current STOP result is not delayed
-by smoothing; poor-quality frames or a lack of relevant current detections
-produce UNCERTAIN rather than a clear-path recommendation.
+by smoothing. Poor-quality, stale, or insufficient evidence produces
+UNCERTAIN. A fresh frame with no relevant detections produces cautious
+MOVE FORWARD guidance with an explicit warning that this does not prove the
+path is safe.
 Result panels also withhold annotated output from an earlier confidence setting
 after the slider changes, until a snapshot produced with the new threshold is
 available.
 
 Blur and motion thresholds should be calibrated against real camera footage because a single blur score or motion estimate does not guarantee safety or detection quality in every scene. The implementation intentionally avoids claiming exact physical localization or robot position.
+
+### Deterministic navigation evaluation
+
+The navigation engine is evaluated with simulated detections in the existing
+`tests/test_navigation.py` suite; this exercises decision correctness without
+model inference or camera hardware:
+
+| Scenario | Expected advisory result |
+| --- | --- |
+| Obstacle confined to the left or right region | Region is classified from box overlap; guidance is `SLOW DOWN` |
+| Medium apparent obstacle in the center, sides equally clear | `UNCERTAIN`; explanation says side evidence does not favor a direction |
+| Obstacles in both side regions | `STOP`; explanation identifies both side regions as obstructed |
+| Fresh frame with no detections | Cautious `MOVE FORWARD`, explicitly not proof of a safe path |
+| Direction evidence changes between frames | No direction is suggested until the same candidate is confirmed in consecutive evaluations |
+| A gap longer than two seconds interrupts evidence | Direction confirmation restarts |
+
+Run the deterministic evaluation with
+`python3 -m unittest discover -s tests -p 'test_navigation.py'`. Its expected
+recommendations and explanation fragments are asserted per scenario. These
+tests validate logic against simulated boxes, not detector accuracy, physical
+distance, real-world clearance, or safety; recommendations remain advisory.
 
 ## Models
 
@@ -83,7 +106,9 @@ Blur and motion thresholds should be calibrated against real camera footage beca
 `best.pt` is loaded exclusively for Custom Object Detection. Its 15 classes
 are Battery, Dice, ToyCar, Ants, Bees, Beetles, Caterpillars, Earthworms,
 Earwigs, Grasshoppers, Moths, Slugs, Snails, Wasps, and Weevils. It is not
-modified by this application.
+modified by this application. These are the labels exposed by the checked-in
+weights; they do not include a `crack` class, so this repository's model
+metadata does not substantiate a crack-specific detector.
 
 ### COCO model
 
@@ -236,6 +261,9 @@ publication. Processing failures count accepted-frame exceptions before a
 successful snapshot publication; the two rate counters distinguish attempts
 from completed snapshot results. Receive and successful-processing rates
 include their event counts and a monotonic elapsed-time denominator.
+Telemetry is a process-wide resource shared by the single active phone camera
+processor and dashboard sessions that read its snapshots; the application
+rejects a second camera owner rather than combining separate camera streams.
 `frames_skipped` retains its
 existing meaning: invalid/empty frames only; it is not a count of throttled
 frames. Counts cover the whole measurement interval; detailed frame timing
@@ -275,6 +303,71 @@ characterize laptop-side processing only; repeatability or a passing configured
 threshold does not establish speed, real-time suitability, or navigation
 safety.
 
+### Separate Custom and Navigation phone-stream runs
+
+Each telemetry export must contain one inference mode and one fixed
+configuration. Do not change modes or settings during a measured interval;
+the importer rejects mixed configurations. For a **Custom Object Detection**
+run, select that mode on Android Camera, let the model warm up, reset telemetry,
+and collect the run for a recorded fixed duration. Prepare and download the
+export, then convert it using a new report filename:
+
+```bash
+.venv/bin/python benchmark_latency.py \
+  --telemetry objectvision-custom-real-stream-telemetry.json \
+  --output objectvision-custom-real-stream-report.json
+```
+
+Repeat in a separate session for **Obstacle Detection & Navigation** (the
+navigation mode). Keep the COCO model and settings fixed for that run and use
+distinct export and report filenames:
+
+```bash
+.venv/bin/python benchmark_latency.py \
+  --telemetry objectvision-navigation-real-stream-telemetry.json \
+  --output objectvision-navigation-real-stream-report.json
+```
+
+For repeatability, collect at least two runs per mode with the same laptop,
+phone/browser, network, model weights, resolution, confidence, tracker, and
+warm-up/sample procedure; compare only the same mode and matching
+configurations. Custom uses `best.pt`, while Navigation uses the separate COCO
+model, so their raw latency results are not a like-for-like model comparison.
+The report tool rejects incompatible repeatability reports rather than
+normalizing different configurations.
+
+### Recorded evaluation evidence
+
+The existing comparable three-run set uses synthetic 640x480 input in
+Navigation mode on the macOS arm64 laptop, CPU, `yolov8n.pt`, confidence 0.35,
+ByteTrack, 10 warm-up frames, and 100 measured frames per run. These are
+processing-stage measurements, not phone-stream measurements:
+
+| Run | Inference p50 / p95 (ms) | Navigation evaluation p50 / p95 (ms) | Frame processing p50 / p95 (ms) |
+| --- | ---: | ---: | ---: |
+| 1 | 18.73 / 19.02 | 0.02 / 0.02 | 19.14 / 19.43 |
+| 2 | 18.99 / 22.30 | 0.02 / 0.02 | 19.40 / 22.74 |
+| 3 | 18.70 / 19.13 | 0.02 / 0.02 | 19.12 / 19.57 |
+
+The saved synthetic reports do not contain receive/processing rates or
+real-stream failure counters. The comparison tool consequently reports
+`receive_rate_hz` and `successful_processing_rate_hz` as unavailable in all
+three runs. The stream timing samples
+(`callback_to_snapshot_publication_ms` and `snapshot_publication_ms`) and
+dashboard timing samples (`dashboard_snapshot_read_ms` and
+`dashboard_render_call_ms`) are also unavailable; these missing values are not
+zero. No real phone-stream telemetry export is currently included in the
+project, so real-stream rates and counts for decode, processing, and snapshot
+publication failures cannot be reported here. Capture a real-stream export
+using the instructions above to measure those values. The 200-sample synthetic
+runs are not combined with this 100-sample repeatability set.
+
+The deterministic navigation tests cover left, center, right, both-side, and
+empty detections, among other decision and evidence-freshness cases. The
+project owner also reports manually exercising left, center, right, empty-view,
+and moving-obstacle scenarios on the phone stream. Those manual checks are
+qualitative and are not a measured accuracy, distance, or safety evaluation.
+
 ## Python and installation
 
 The system Python in this workspace reports Python 3.14.6. The existing
@@ -302,8 +395,8 @@ source .venv/bin/activate
 ```
 
 No dependency changes are required for the added navigation engine. The
-existing `requirements.txt` covers Streamlit, streamlit-webrtc, OpenCV,
-Ultralytics, PyTorch, and the WebRTC media stack.
+existing `requirements.txt` lists `av`, `opencv-python-headless`, `streamlit`,
+`streamlit-webrtc`, `torch`, `torchvision`, `ultralytics`, and `lap`.
 
 ## Start the application
 
@@ -485,13 +578,14 @@ Run the navigation tests without a camera or downloaded weights:
 
 ```bash
 source .venv/bin/activate
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -p 'test_navigation.py' -v
 ```
 
-Run syntax and dependency checks:
+Run the complete unit-test suite, syntax checks, and dependency check:
 
 ```bash
-python -m py_compile app.py navigation.py tests/test_navigation.py
+python -m unittest discover -s tests -v
+python -m py_compile app.py navigation.py benchmark_latency.py tests/*.py
 python -m pip check
 ```
 
@@ -514,8 +608,12 @@ downloaded as part of the unit tests.
   latest frames, and bounded metrics; local runtime data.
 - `certs/` — supplied certificates, preserved and not modified by the launcher.
 
-Android compatibility has **not** been verified on a physical Android device.
-Manual testing is still required for the target Android/Chrome version,
-certificate trust behavior, Wi-Fi/firewall access, phone camera permissions,
-and real-time CPU performance. COCO model download and live inference also
-require first-run validation on the target laptop.
+The project owner confirms that an Android phone currently streams to the
+macOS laptop over HTTPS and WebRTC, with laptop-side YOLO inference, live
+Streamlit results, and advisory Navigation mode working on that setup. The
+reported manual scenarios are listed above. Phone/Android and Chrome versions,
+network conditions, and quantitative real-stream rates/failure counts have
+not been recorded, so this does not establish compatibility across other
+devices or networks, detector accuracy, physical distance, real-time
+suitability, or safety. COCO model download and live inference still depend on
+the separate `yolov8n.pt` weights being available.

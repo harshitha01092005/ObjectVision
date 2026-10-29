@@ -206,6 +206,39 @@ class VisualIntelligenceTests(unittest.TestCase):
             memory.update([], timestamp=float(idx + 2))
         self.assertIn(memory.tracks[1].status, {"TEMPORARILY MISSING", "LOST"})
 
+    def test_visual_memory_matches_each_detection_to_at_most_one_track_per_frame(self):
+        memory = VisualMemory()
+        memory.update(
+            [
+                FakeDetection("person", 0.9, 0, 0, 100, 100),
+                FakeDetection("person", 0.9, 30, 0, 130, 100),
+            ],
+            timestamp=1.0,
+        )
+
+        self.assertEqual(set(memory.tracks), {1, 2})
+        self.assertEqual(
+            [track.observations for track in memory.tracks.values()],
+            [1, 1],
+        )
+
+        memory.update(
+            [
+                FakeDetection("person", 0.9, 10, 0, 110, 100),
+                FakeDetection("person", 0.9, 30, 0, 130, 100),
+            ],
+            timestamp=2.0,
+        )
+
+        self.assertEqual(set(memory.tracks), {1, 2})
+        self.assertEqual(
+            [track.observations for track in memory.tracks.values()],
+            [2, 2],
+        )
+        self.assertTrue(
+            all(track.status == "ACTIVE" for track in memory.tracks.values())
+        )
+
     def test_visual_memory_reacquires_a_missing_track(self):
         memory = VisualMemory()
         memory.update([FakeDetection("person", 0.9, 10, 20, 80, 120)], timestamp=1.0)

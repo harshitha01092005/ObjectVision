@@ -231,8 +231,11 @@ class NavigationEngine:
                 continue
             valid_detections.append(detection)
 
-        if self._previous_frame_time is None or current_time - self._previous_frame_time > 2:
-            self._previous_boxes.clear()
+        if (
+            self._previous_frame_time is None
+            or current_time - self._previous_frame_time > 2
+        ):
+            self._clear_tracking()
 
         evaluated: list[EvaluatedDetection] = []
         current_boxes: list[tuple[str, float, float, float, float]] = []

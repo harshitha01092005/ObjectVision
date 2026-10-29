@@ -384,17 +384,21 @@ class StreamTelemetry:
         }
 
 
-STREAM_TELEMETRY = StreamTelemetry()
+@st.cache_resource
+def get_stream_telemetry() -> StreamTelemetry:
+    """Return the process-wide telemetry for the single active camera stream."""
+    return StreamTelemetry()
 
 
 def read_dashboard_snapshot(
     mode: str, view: str
 ) -> tuple[dict[str, Any], bytes] | None:
-    generation = STREAM_TELEMETRY.generation()
+    telemetry = get_stream_telemetry()
+    generation = telemetry.generation()
     started_ns = time.perf_counter_ns()
     snapshot = read_snapshot(mode)
     elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
-    STREAM_TELEMETRY.record_dashboard(
+    telemetry.record_dashboard(
         view=view,
         stage="snapshot_read",
         elapsed_ms=elapsed_ms,
@@ -408,12 +412,13 @@ def measure_dashboard_render(view: str):
     def decorate(render: Any):
         @wraps(render)
         def measured(*args: Any, **kwargs: Any):
-            generation = STREAM_TELEMETRY.generation()
+            telemetry = get_stream_telemetry()
+            generation = telemetry.generation()
             started_ns = time.perf_counter_ns()
             try:
                 return render(*args, **kwargs)
             finally:
-                STREAM_TELEMETRY.record_dashboard(
+                telemetry.record_dashboard(
                     view=view,
                     stage="render_call",
                     elapsed_ms=(
@@ -920,9 +925,10 @@ def gate_navigation_evidence(
 class ObjectVideoProcessor(VideoProcessorBase):
     def __init__(self, owner: str) -> None:
         self.owner = owner
+        self.telemetry = get_stream_telemetry()
         self.allowed = acquire_camera(owner)
         if self.allowed:
-            STREAM_TELEMETRY.start(owner)
+            self.telemetry.start(owner)
         if not self.allowed:
             write_camera_status(
                 "Another phone camera stream is active. Stop that stream before connecting this one."
@@ -953,14 +959,14 @@ class ObjectVideoProcessor(VideoProcessorBase):
         frame_received_at = time.time()
         if not self.allowed:
             return frame
-        telemetry_generation = STREAM_TELEMETRY.begin_callback(
+        telemetry_generation = self.telemetry.begin_callback(
             self.owner,
             callback_started_ns,
         )
         try:
             image = frame.to_ndarray(format="bgr24")
         except Exception as exc:
-            STREAM_TELEMETRY.increment(
+            self.telemetry.increment(
                 self.owner,
                 "decode_failures",
                 generation=telemetry_generation,
@@ -979,12 +985,12 @@ class ObjectVideoProcessor(VideoProcessorBase):
             or image.shape[2] != 3
         ):
             self.frames_skipped += 1
-            STREAM_TELEMETRY.increment(
+            self.telemetry.increment(
                 self.owner,
                 "frames_skipped",
                 generation=telemetry_generation,
             )
-            STREAM_TELEMETRY.increment(
+            self.telemetry.increment(
                 self.owner,
                 "invalid_frames",
                 generation=telemetry_generation,
@@ -996,7 +1002,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
                 "Received an empty or invalid video frame.",
             )
             return frame
-        STREAM_TELEMETRY.increment(
+        self.telemetry.increment(
             self.owner,
             "valid_decoded_frames",
             generation=telemetry_generation,
@@ -1011,7 +1017,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
             STREAM.frames += 1
             frame_id = STREAM.frames
         self.frames_received += 1
-        STREAM_TELEMETRY.increment(
+        self.telemetry.increment(
             self.owner,
             "frames_received",
             generation=telemetry_generation,
@@ -1032,7 +1038,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
             self.active_mode = mode
             self.navigation_engine.reset()
         if frame_received_at - self.last_inference_at < 0.2:
-            STREAM_TELEMETRY.increment(
+            self.telemetry.increment(
                 self.owner,
                 "inference_throttled_frames",
                 generation=telemetry_generation,
@@ -1052,7 +1058,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
 
         confidence = read_confidence()
         if time.time() < self.model_retry_after.get(mode, 0):
-            STREAM_TELEMETRY.increment(
+            self.telemetry.increment(
                 self.owner,
                 "retry_suppressed_frames",
                 generation=telemetry_generation,
@@ -1068,7 +1074,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
             last_frame_received_at=frame_received_at,
             inference_status="running",
         )
-        STREAM_TELEMETRY.increment(
+        self.telemetry.increment(
             self.owner,
             "accepted_for_processing",
             generation=telemetry_generation,
@@ -1281,7 +1287,7 @@ class ObjectVideoProcessor(VideoProcessorBase):
             write_snapshot(mode, annotated, metrics)
             snapshot_published = True
             published_ns = time.perf_counter_ns()
-            STREAM_TELEMETRY.record_snapshot(
+            self.telemetry.record_snapshot(
                 self.owner,
                 {
                     "frame_id": frame_id,
@@ -1351,13 +1357,13 @@ class ObjectVideoProcessor(VideoProcessorBase):
             return av.VideoFrame.from_ndarray(annotated, format="bgr24")
         except Exception as exc:
             if not snapshot_published:
-                STREAM_TELEMETRY.increment(
+                self.telemetry.increment(
                     self.owner,
                     "processing_failures",
                     generation=telemetry_generation,
                 )
             if snapshot_started_ns is not None and not snapshot_published:
-                STREAM_TELEMETRY.increment(
+                self.telemetry.increment(
                     self.owner,
                     "snapshot_publication_failures",
                     generation=telemetry_generation,
@@ -1494,19 +1500,20 @@ def show_camera_status(
     else:
         st.info(f"Waiting for phone camera connection. {text}")
     if owner:
+        telemetry = get_stream_telemetry()
         if st.button(
             "Reset telemetry after warm-up",
             help="Clear session counts and timing samples; the next received frame starts the measured interval.",
             key="reset-stream-telemetry",
         ):
-            STREAM_TELEMETRY.start(owner, warmup_excluded=True)
+            telemetry.start(owner, warmup_excluded=True)
             st.session_state.pop("stream-telemetry-export", None)
         if st.button(
             "Prepare telemetry export",
             key="prepare-stream-telemetry",
         ):
             st.session_state["stream-telemetry-export"] = json.dumps(
-                STREAM_TELEMETRY.export(),
+                telemetry.export(),
                 indent=2,
                 allow_nan=False,
             )

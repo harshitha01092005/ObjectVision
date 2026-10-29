@@ -5,6 +5,7 @@ from navigation import (
     GO_LEFT,
     GO_RIGHT,
     MOVE_FORWARD,
+    SLOW_DOWN,
     STOP,
     UNCERTAIN,
     Detection,
@@ -64,6 +65,60 @@ class NavigationEngineTests(unittest.TestCase):
         result = self.evaluate([])
         self.assertEqual(result.recommendation, MOVE_FORWARD)
         self.assertIn("does not prove", result.explanation)
+
+    def test_deterministic_obstacle_scenarios_match_regions_and_explanations(self) -> None:
+        scenarios = (
+            (
+                "left obstacle",
+                [self.box("chair", 0.9, 5, 20, 95, 160)],
+                SLOW_DOWN,
+                ("LEFT",),
+                "medium or high apparent proximity",
+            ),
+            (
+                "center obstacle",
+                [self.box("person", 0.9, 105, 20, 195, 160)],
+                UNCERTAIN,
+                ("CENTER",),
+                "center appears obstructed",
+            ),
+            (
+                "right obstacle",
+                [self.box("chair", 0.9, 205, 20, 295, 160)],
+                SLOW_DOWN,
+                ("RIGHT",),
+                "medium or high apparent proximity",
+            ),
+            (
+                "obstacles on both sides",
+                [
+                    self.box("chair", 0.9, 5, 20, 95, 160),
+                    self.box("bench", 0.9, 205, 20, 295, 160),
+                ],
+                STOP,
+                ("LEFT", "RIGHT"),
+                "both side regions appear obstructed",
+            ),
+            (
+                "no detections",
+                [],
+                MOVE_FORWARD,
+                (),
+                "does not prove the path is safe",
+            ),
+        )
+
+        for name, detections, expected, expected_regions, explanation in scenarios:
+            with self.subTest(scenario=name):
+                result = self.evaluate(detections)
+                occupied_regions = tuple(
+                    region
+                    for region in ("LEFT", "CENTER", "RIGHT")
+                    if result.regions[region].objects
+                )
+                self.assertEqual(result.recommendation, expected)
+                self.assertEqual(occupied_regions, expected_regions)
+                self.assertIn(explanation, result.explanation)
 
     def test_high_apparent_proximity_in_center_prioritizes_stop(self) -> None:
         result = self.evaluate([self.box("person", 0.95, 110, 30, 190, 270)])
@@ -401,6 +456,25 @@ class NavigationEngineTests(unittest.TestCase):
         self.assertEqual(self.evaluate(left_clear).recommendation, GO_LEFT)
         self.assertEqual(self.evaluate(right_clear).recommendation, UNCERTAIN)
         self.assertEqual(self.evaluate(right_clear).recommendation, GO_RIGHT)
+
+    def test_long_frame_gap_restarts_direction_confirmation(self) -> None:
+        left_clear = [
+            self.box("person", 0.9, 110, 30, 190, 150),
+            self.box("chair", 0.9, 225, 20, 295, 140),
+        ]
+
+        first = self.evaluate(left_clear)
+        self.assertEqual(first.recommendation, UNCERTAIN)
+        self.assertIn("waiting for a consistent frame", first.explanation)
+
+        self.now += 3.0
+        after_gap = self.evaluate(left_clear)
+        self.assertEqual(after_gap.recommendation, UNCERTAIN)
+        self.assertIn("waiting for a consistent frame", after_gap.explanation)
+
+        confirmed = self.evaluate(left_clear)
+        self.assertEqual(confirmed.recommendation, GO_LEFT)
+        self.assertIn("left region has less detected obstruction", confirmed.explanation)
 
     def test_rapid_direction_alternation_never_emits_unconfirmed_direction(self) -> None:
         left_clear = [

@@ -1,0 +1,69 @@
+{
+  "benchmark": "ObjectVision processed-frame latency",
+  "generated_at_utc": "2026-10-24T07:17:18.367498+00:00",
+  "method": {
+    "warmup_frames": 10,
+    "measured_frames": 100,
+    "warmup_excluded_from_statistics": true,
+    "percentile_method": "nearest rank",
+    "inference_throttle_wait_included": false,
+    "input_read_decode_and_resize_included": false,
+    "frame_decode_quality_and_motion_analysis_included": false,
+    "camera_wait_included": false,
+    "snapshot_serialization_and_publication_included": false,
+    "frame_processing_interval": "from accepted inference processing start after frame decode, quality/motion analysis, throttling, and retry checks through operator assistance generation"
+  },
+  "environment": {
+    "os": "macOS-26.5-arm64-arm-64bit",
+    "python": "3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 21.0.0 (clang-2100.0.123.102)]",
+    "architecture": "arm64",
+    "processor": "arm",
+    "logical_cpu_count": 10,
+    "ultralytics": "8.4.183"
+  },
+  "input": {
+    "kind": "deterministic_synthetic",
+    "live": false,
+    "resolution": {
+      "width": 640,
+      "height": 480
+    },
+    "frames_are_saved": false,
+    "generator": "coordinate_pattern_v1"
+  },
+  "inference": {
+    "mode": "navigation",
+    "model_name": "yolov8n.pt",
+    "model_file": "yolov8n.pt",
+    "model_sha256": "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+    "model_class_count": 80,
+    "confidence": 0.35,
+    "device": "cpu",
+    "tracker": "objectvision_bytetrack.yaml",
+    "persist": true,
+    "imgsz": "Ultralytics default; not explicitly passed"
+  },
+  "latency": {
+    "inference_latency_ms": {
+      "total_samples": 100,
+      "sample_count": 100,
+      "unavailable_samples": 0,
+      "p50_ms": 18.7,
+      "p95_ms": 19.13
+    },
+    "navigation_evaluation_latency_ms": {
+      "total_samples": 100,
+      "sample_count": 100,
+      "unavailable_samples": 0,
+      "p50_ms": 0.02,
+      "p95_ms": 0.02
+    },
+    "frame_processing_latency_ms": {
+      "total_samples": 100,
+      "sample_count": 100,
+      "unavailable_samples": 0,
+      "p50_ms": 19.12,
+      "p95_ms": 19.57
+    }
+  }
+}

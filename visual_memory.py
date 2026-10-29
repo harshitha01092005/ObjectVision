@@ -133,6 +133,8 @@ class VisualMemory:
             matched_track_id = None
             matched_iou = 0.0
             for track_id, track in self.tracks.items():
+                if track_id in active_track_ids:
+                    continue
                 if track.label != label:
                     continue
                 if track.status == "LOST":
